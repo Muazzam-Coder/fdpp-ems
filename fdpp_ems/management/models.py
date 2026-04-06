@@ -2,10 +2,29 @@ from django.db import models
 from django.contrib.auth.models import User
 from django.core.validators import RegexValidator
 from django.utils import timezone
-from django.db.models.signals import pre_save
+from django.db.models.signals import pre_save, post_save
 from django.dispatch import receiver
 from datetime import timedelta, datetime, time
 from decimal import Decimal
+
+# User Access Level Model
+class UserAccessLevel(models.Model):
+    ROLE_CHOICES = [
+        ('admin', 'Admin'),
+        ('manager', 'Manager'),
+    ]
+    
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='access_level')
+    role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='manager')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        verbose_name = 'User Access Level'
+        verbose_name_plural = 'User Access Levels'
+    
+    def __str__(self):
+        return f"{self.user.username} - {self.get_role_display()}"
 
 class Employee(models.Model):
     SHIFT_CHOICES = [
@@ -15,11 +34,11 @@ class Employee(models.Model):
         ('flexible', 'Flexible'),
     ]
 
-    # Link to user authentication
+    # Link to user authentication (optional)
     user = models.OneToOneField(User, on_delete=models.CASCADE, null=True, blank=True, related_name='employee_profile')
     
-    # Auto-generated emp_id (EMP0001, EMP0002, etc.)
-    emp_id = models.CharField(max_length=50, unique=True, editable=False)
+    # Simple integer emp_id (1, 2, 3, etc.)
+    emp_id = models.IntegerField(unique=True, editable=False, db_index=True)
     name = models.CharField(max_length=255)
     profile_img = models.ImageField(upload_to='profiles/', null=True, blank=True)
     
@@ -37,13 +56,13 @@ class Employee(models.Model):
     r_phone = models.CharField(max_length=20)
     r_address = models.TextField()
     
-    # Additional fields
+    # Additional fields - date_joined is now editable
     status = models.CharField(
         max_length=20,
         choices=[('active', 'Active'), ('inactive', 'Inactive')],
         default='active'
     )
-    date_joined = models.DateField(auto_now_add=True)
+    date_joined = models.DateField(default=timezone.now)  # Changed from auto_now_add to editable
     last_modified = models.DateTimeField(auto_now=True)
 
     class Meta:
@@ -68,15 +87,21 @@ class Employee(models.Model):
 
 @receiver(pre_save, sender=Employee)
 def auto_generate_emp_id(sender, instance, **kwargs):
-    """Auto-generate emp_id in format EMP0001, EMP0002, etc."""
+    """Auto-generate emp_id as simple integers: 1, 2, 3, etc."""
     if not instance.emp_id:
-        last_employee = Employee.objects.all().order_by('-id').first()
+        last_employee = Employee.objects.all().order_by('-emp_id').first()
         if last_employee:
-            last_id = int(last_employee.emp_id.replace('EMP', ''))
-            new_id = last_id + 1
+            new_id = last_employee.emp_id + 1
         else:
             new_id = 1
-        instance.emp_id = f'EMP{new_id:04d}'
+        instance.emp_id = new_id
+
+
+@receiver(post_save, sender=User)
+def create_access_level(sender, instance, created, **kwargs):
+    """Create UserAccessLevel for new users"""
+    if created:
+        UserAccessLevel.objects.get_or_create(user=instance)
 
 class Attendance(models.Model):
     STATUS_CHOICES = [

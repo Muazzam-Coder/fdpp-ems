@@ -1,15 +1,38 @@
 from django.contrib import admin
-from .models import Employee, Attendance, PaidLeave, Shift
+from .models import Employee, Attendance, PaidLeave, Shift, UserAccessLevel
+
+@admin.register(UserAccessLevel)
+class UserAccessLevelAdmin(admin.ModelAdmin):
+    list_display = ['user', 'role', 'created_at']
+    list_filter = ['role', 'created_at']
+    search_fields = ['user__username', 'user__email']
+    readonly_fields = ['created_at', 'updated_at']
+    
+    fieldsets = (
+        ('User', {
+            'fields': ['user']
+        }),
+        ('Access Level', {
+            'fields': ['role']
+        }),
+        ('Timestamps', {
+            'fields': ['created_at', 'updated_at'],
+            'classes': ['collapse']
+        }),
+    )
 
 @admin.register(Employee)
 class EmployeeAdmin(admin.ModelAdmin):
     list_display = ['emp_id', 'name', 'shift_type', 'status', 'date_joined']
     list_filter = ['status', 'shift_type', 'date_joined']
     search_fields = ['emp_id', 'name', 'CNIC', 'phone']
-    readonly_fields = ['date_joined', 'last_modified']
+    readonly_fields = ['emp_id', 'last_modified']
     fieldsets = (
+        ('Employee ID', {
+            'fields': ['emp_id']
+        }),
         ('Personal Information', {
-            'fields': ['emp_id', 'name', 'profile_img', 'address', 'phone', 'CNIC']
+            'fields': ['name', 'profile_img', 'address', 'phone', 'CNIC']
         }),
         ('Emergency Contact', {
             'fields': ['relative', 'r_phone', 'r_address']
@@ -20,7 +43,7 @@ class EmployeeAdmin(admin.ModelAdmin):
         ('Financial Information', {
             'fields': ['salary', 'hourly_rate']
         }),
-        ('Status', {
+        ('Status & Dates', {
             'fields': ['status', 'date_joined', 'last_modified']
         }),
     )

@@ -4,11 +4,28 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from django_filters import rest_framework as filters
 from django.contrib.auth.models import User
-from .models import Employee, Attendance, PaidLeave, Shift
-from .serializers import EmployeeSerializer, AttendanceSerializer, PaidLeaveSerializer, ShiftSerializer, UserSerializer
+from .models import Employee, Attendance, PaidLeave, Shift, UserAccessLevel
+from .serializers import (
+    EmployeeSerializer, AttendanceSerializer, PaidLeaveSerializer, 
+    ShiftSerializer, UserSerializer, UserAccessLevelSerializer,
+    CreateAdminManagerSerializer
+)
 from django.db.models import Sum, Count, Q, Avg
 from datetime import datetime, timedelta, date
 from django.utils import timezone
+
+# Permission check: Only admins can create admin/manager
+def is_admin(user):
+    """Check if user has admin role"""
+    try:
+        return user.access_level.role == 'admin'
+    except (AttributeError, UserAccessLevel.DoesNotExist):
+        return False
+
+class IsAdmin(IsAuthenticated):
+    """Permission class for admin access"""
+    def has_permission(self, request, view):
+        return super().has_permission(request, view) and is_admin(request.user)
 
 # Authentication ViewSet
 class AuthViewSet(viewsets.ViewSet):
@@ -40,6 +57,23 @@ class AuthViewSet(viewsets.ViewSet):
             }, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     
+    @action(detail=False, methods=['post'], permission_classes=[IsAdmin])
+    def create_admin_manager(self, request):
+        """Create a new admin or manager user (admin only)"""
+        serializer = CreateAdminManagerSerializer(data=request.data)
+        if serializer.is_valid():
+            user = serializer.save()
+            return Response({
+                "message": f"User created successfully as {serializer.validated_data['role']}",
+                "user": {
+                    "id": user.id,
+                    "username": user.username,
+                    "email": user.email,
+                    "role": serializer.validated_data['role']
+                }
+            }, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    
     @action(detail=False, methods=['post'])
     def login(self, request):
         """User login endpoint"""
@@ -50,23 +84,58 @@ class AuthViewSet(viewsets.ViewSet):
         user = authenticate(username=username, password=password)
         if user:
             try:
-                employee = user.employee_profile
+                # Fetch access level directly from database to get latest data
+                access_level = UserAccessLevel.objects.get(user=user)
                 return Response({
                     "message": "Login successful",
                     "user_id": user.id,
                     "username": user.username,
-                    "emp_id": employee.emp_id,
-                    "name": employee.name
+                    "email": user.email,
+                    "role": access_level.role
                 }, status=status.HTTP_200_OK)
-            except Employee.DoesNotExist:
-                return Response(
-                    {"error": "Employee profile not found"},
-                    status=status.HTTP_404_NOT_FOUND
-                )
+            except UserAccessLevel.DoesNotExist:
+                # Try to get employee profile if user has one
+                try:
+                    employee = user.employee_profile
+                    return Response({
+                        "message": "Login successful",
+                        "user_id": user.id,
+                        "username": user.username,
+                        "email": user.email,
+                        "emp_id": employee.emp_id,
+                        "name": employee.name,
+                        "role": "employee"
+                    }, status=status.HTTP_200_OK)
+                except Employee.DoesNotExist:
+                    return Response(
+                        {"error": "User profile not found"},
+                        status=status.HTTP_404_NOT_FOUND
+                    )
         return Response(
             {"error": "Invalid credentials"},
             status=status.HTTP_401_UNAUTHORIZED
         )
+
+
+class UserAccessLevelViewSet(viewsets.ModelViewSet):
+    """Manage user access levels (admin/manager)"""
+    queryset = UserAccessLevel.objects.all()
+    serializer_class = UserAccessLevelSerializer
+    permission_classes = [IsAdmin]
+    
+    @action(detail=False, methods=['get'])
+    def admins(self, request):
+        """Get all admin users"""
+        admins = UserAccessLevel.objects.filter(role='admin')
+        serializer = self.get_serializer(admins, many=True)
+        return Response(serializer.data)
+    
+    @action(detail=False, methods=['get'])
+    def managers(self, request):
+        """Get all manager users"""
+        managers = UserAccessLevel.objects.filter(role='manager')
+        serializer = self.get_serializer(managers, many=True)
+        return Response(serializer.data)
 
 
 # Filtering logic for Attendance
@@ -93,6 +162,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
     filterset_class = EmployeeFilter
     filter_backends = (filters.DjangoFilterBackend,)
     lookup_field = 'emp_id'  # Use emp_id for URL lookups like /employees/EMP001/
+    permission_classes = [IsAuthenticated]
 
     @action(detail=True, methods=['get'])
     def calculate_payout(self, request, pk=None):
@@ -225,6 +295,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
     serializer_class = AttendanceSerializer
     filter_backends = (filters.DjangoFilterBackend,)
     filterset_class = AttendanceFilter
+    permission_classes = [IsAuthenticated]
 
     @action(detail=False, methods=['get'])
     def daily_report(self, request):
@@ -322,7 +393,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             "average_daily_attendance": round(total_days / unique_employees, 2) if unique_employees > 0 else 0
         })
 
-    @action(detail=False, methods=['post'])
+    @action(detail=False, methods=['post'], permission_classes=[AllowAny])
     def check_in(self, request):
         """Check in an employee"""
         emp_id = request.data.get('emp_id')
@@ -367,7 +438,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             status=status.HTTP_201_CREATED
         )
 
-    @action(detail=False, methods=['post'])
+    @action(detail=False, methods=['post'], permission_classes=[AllowAny])
     def check_out(self, request):
         """Check out an employee"""
         emp_id = request.data.get('emp_id')
@@ -419,6 +490,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 class PaidLeaveViewSet(viewsets.ModelViewSet):
     queryset = PaidLeave.objects.all().order_by('-start_time')
     serializer_class = PaidLeaveSerializer
+    permission_classes = [IsAuthenticated]
 
     @action(detail=True, methods=['post'])
     def approve(self, request, pk=None):
@@ -468,3 +540,4 @@ class PaidLeaveViewSet(viewsets.ModelViewSet):
 class ShiftViewSet(viewsets.ModelViewSet):
     queryset = Shift.objects.all()
     serializer_class = ShiftSerializer
+    permission_classes = [IsAuthenticated]

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 FDPP-EMS Seed/Feed Data Script
-Creates dummy data for testing and development
+Creates dummy data for testing and development with user authentication
 Run: python seed_data.py
 """
 
@@ -15,6 +15,7 @@ os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'fdpp_ems.settings')
 django.setup()
 
 from management.models import Employee, Attendance, PaidLeave, Shift
+from django.contrib.auth.models import User
 from django.utils import timezone
 
 # Color codes for terminal output
@@ -78,14 +79,18 @@ def create_shifts():
             print_info(f"Already exists: {shift.name}")
 
 def create_employees():
-    """Create sample employees"""
+    """Create sample employees with user authentication"""
     print(f"\n{BLUE}{'='*60}")
-    print("Creating Employees...")
+    print("Creating Employees with User Accounts...")
     print(f"{'='*60}{RESET}")
     
     employees_data = [
         {
-            'emp_id': '0001',
+            'username': 'muazzam_ali',
+            'email': 'muazzam@example.com',
+            'first_name': 'Muazzam',
+            'last_name': 'Ali',
+            'password': 'password123',
             'name': 'Muazzam Ali',
             'salary': 75000,
             'hourly_rate': 468.75,
@@ -101,7 +106,11 @@ def create_employees():
             'status': 'active'
         },
         {
-            'emp_id': '0002',
+            'username': 'ayesha_khan',
+            'email': 'ayesha@example.com',
+            'first_name': 'Ayesha',
+            'last_name': 'Khan',
+            'password': 'password123',
             'name': 'Ayesha Khan',
             'salary': 65000,
             'hourly_rate': 406.25,
@@ -117,7 +126,11 @@ def create_employees():
             'status': 'active'
         },
         {
-            'emp_id': '0003',
+            'username': 'hassan_malik',
+            'email': 'hassan@example.com',
+            'first_name': 'Hassan',
+            'last_name': 'Malik',
+            'password': 'password123',
             'name': 'Hassan Malik',
             'salary': 55000,
             'hourly_rate': 343.75,
@@ -133,7 +146,11 @@ def create_employees():
             'status': 'active'
         },
         {
-            'emp_id': '0004',
+            'username': 'saira_ahmed',
+            'email': 'saira@example.com',
+            'first_name': 'Saira',
+            'last_name': 'Ahmed',
+            'password': 'password123',
             'name': 'Saira Ahmed',
             'salary': 70000,
             'hourly_rate': 437.50,
@@ -149,7 +166,11 @@ def create_employees():
             'status': 'active'
         },
         {
-            'emp_id': '0005',
+            'username': 'ali_raza',
+            'email': 'ali@example.com',
+            'first_name': 'Ali',
+            'last_name': 'Raza',
+            'password': 'password123',
             'name': 'Ali Raza',
             'salary': 60000,
             'hourly_rate': 375.00,
@@ -167,12 +188,42 @@ def create_employees():
     ]
     
     for emp_data in employees_data:
-        employee, created = Employee.objects.get_or_create(
-            emp_id=emp_data['emp_id'],
-            defaults={k: v for k, v in emp_data.items() if k != 'emp_id'}
+        # Extract user data
+        username = emp_data.pop('username')
+        email = emp_data.pop('email')
+        first_name = emp_data.pop('first_name')
+        last_name = emp_data.pop('last_name')
+        password = emp_data.pop('password')
+        
+        # Create or get user
+        user, user_created = User.objects.get_or_create(
+            username=username,
+            defaults={
+                'email': email,
+                'first_name': first_name,
+                'last_name': last_name,
+            }
         )
-        if created:
-            print_success(f"Created: {employee.name} ({employee.emp_id})")
+        
+        # Set password if new user
+        if user_created:
+            user.set_password(password)
+            user.save()
+            print_success(f"Created user: {username}")
+        else:
+            print_info(f"User already exists: {username}")
+        
+        # Create or get employee (emp_id auto-generates)
+        employee, emp_created = Employee.objects.get_or_create(
+            CNIC=emp_data['CNIC'],
+            defaults={
+                'user': user,
+                **emp_data
+            }
+        )
+        
+        if emp_created:
+            print_success(f"Created employee: {employee.name} ({employee.emp_id})")
         else:
             print_info(f"Already exists: {employee.name} ({employee.emp_id})")
 
@@ -189,6 +240,10 @@ def create_attendance():
         check_date = today - timedelta(days=i)
         
         for employee in employees:
+            # Skip if already exists
+            if Attendance.objects.filter(employee=employee, date=check_date).exists():
+                continue
+            
             # Random check times
             check_in_hour = 6 + (i % 2)  # 6 or 7 AM
             check_in_minute = (i * 10) % 60
@@ -220,8 +275,6 @@ def create_attendance():
             if created:
                 hours = (check_out - check_in).total_seconds() / 3600
                 print_success(f"{employee.name} - {check_date} - {hours:.1f}h ({status})")
-            else:
-                print_info(f"Already exists: {employee.name} - {check_date}")
 
 def create_leave():
     """Create sample leave records"""
@@ -302,6 +355,8 @@ def create_bulk_attendance():
                 status='late' if is_late else 'on_time',
                 message_late='Traffic' if is_late else None
             )
+    
+    print_success(f"Created bulk attendance data for 30 days")
 
 def delete_all_data():
     """Delete all data (for fresh start)"""
@@ -318,8 +373,7 @@ def delete_all_data():
     Employee.objects.all().delete()
     print_warning("Deleted all employees")
     
-    Shift.objects.all().delete()
-    print_warning("Deleted all shifts")
+    # Don't delete shifts - they may be reused
 
 def display_summary():
     """Display summary of created data"""
@@ -328,11 +382,13 @@ def display_summary():
     print(f"{'='*60}{RESET}")
     
     total_employees = Employee.objects.count()
+    total_users = User.objects.filter(employee_profile__isnull=False).count()
     total_attendance = Attendance.objects.count()
     total_leaves = PaidLeave.objects.count()
     total_shifts = Shift.objects.count()
     
     print_success(f"Total Employees: {total_employees}")
+    print_success(f"Total Users with Employee Profiles: {total_users}")
     print_success(f"Total Attendance Records: {total_attendance}")
     print_success(f"Total Leave Requests: {total_leaves}")
     print_success(f"Total Shifts: {total_shifts}")
@@ -341,7 +397,14 @@ def display_summary():
         avg_attendance = total_attendance // total_employees if total_employees > 0 else 0
         print_info(f"Average Attendance Records per Employee: {avg_attendance}")
     
+    print(f"\n{BLUE}CREATED USERS (for login testing):{RESET}")
+    employees = Employee.objects.all()
+    for employee in employees:
+        if employee.user:
+            print_info(f"Username: {employee.user.username} | Password: password123 | ID: {employee.emp_id}")
+    
     print(f"\n{BLUE}API ENDPOINTS TO TEST:{RESET}")
+    print_info("POST /api/auth/login/ - Login user")
     print_info("GET /api/employees/ - List all employees")
     print_info("GET /api/attendance/ - List attendance records")
     print_info("GET /api/attendance/daily_report/ - Today's report")
@@ -357,7 +420,7 @@ def display_summary():
 def main():
     """Main execution"""
     print(f"\n{BLUE}{'='*60}")
-    print("FDPP-EMS DATABASE SEEDER")
+    print("FDPP-EMS DATABASE SEEDER (with Authentication)")
     print(f"{'='*60}{RESET}\n")
     
     try:

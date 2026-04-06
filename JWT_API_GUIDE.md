@@ -42,7 +42,7 @@ Response (201 Created):
         "username": "john_doe",
         "email": "john@example.com"
     },
-    "employee_id": 1
+    "employee_id": "EMP0001"
 }
 ```
 
@@ -92,76 +92,6 @@ Response (200 OK):
 
 ---
 
-### 4. User Login (Get Role & User Info)
-Login endpoint that returns user info including role (admin/manager/employee).
-
-```http
-POST /api/auth/login/
-Content-Type: application/json
-
-{
-    "username": "john_doe",
-    "password": "secure_password123"
-}
-
-Response for Admin/Manager (200 OK):
-{
-    "message": "Login successful",
-    "user_id": 1,
-    "username": "john_doe",
-    "email": "john@example.com",
-    "role": "admin"
-}
-
-Response for Employee (200 OK):
-{
-    "message": "Login successful",
-    "user_id": 2,
-    "username": "employee_user",
-    "email": "emp@example.com",
-    "emp_id": 1,
-    "name": "John Doe",
-    "role": "employee"
-}
-```
-
----
-
-### 5. Create Admin or Manager User (Admin Only 🔐)
-Only admins can create new admin or manager users. This endpoint allows creating users with specific access levels.
-
-```http
-POST /api/auth/create_admin_manager/
-Authorization: Bearer <admin_access_token>
-Content-Type: application/json
-
-{
-    "username": "new_manager",
-    "email": "manager@example.com",
-    "password": "secure_password123",
-    "first_name": "Ahmed",
-    "last_name": "Khan",
-    "role": "manager"
-}
-
-Valid roles:
-- "admin": Full access to create other admins/managers
-- "manager": Can manage employees and reports
-
-Response (201 Created):
-{
-    "message": "User created successfully as manager",
-    "user": {
-        "id": 5,
-        "username": "new_manager",
-        "email": "manager@example.com",
-        "role": "manager"
-    }
-}
-```
-
----
-
 ## 📨 Using Access Token
 
 All API requests (except auth endpoints) require **Bearer token** in the Authorization header:
@@ -184,7 +114,7 @@ Response (200 OK):
     "results": [
         {
             "id": 1,
-            "emp_id": 1,
+            "emp_id": "EMP0001",
             "name": "John Doe",
             "salary": "50000.00",
             ...
@@ -202,27 +132,13 @@ Response (200 OK):
 http://localhost:8000/api/
 ```
 
-### Authentication Endpoints (❌ No Token Required, except create_admin_manager)
-
-| Endpoint | Method | Auth | Description |
-|----------|--------|------|-------------|
-| `/auth/register/` | POST | ❌ None | Register new employee user |
-| `/auth/login/` | POST | ❌ None | User login (returns role) |
-| `/auth/create_admin_manager/` | POST | 🔐 Admin Only | Create admin or manager user |
-| `/token/` | POST | ❌ None | Get access & refresh tokens (JWT) |
-| `/token/refresh/` | POST | ❌ None | Refresh access token (JWT) |
-
-### Access Level Endpoints (✅ Admin Only 🔐)
+### Authentication Endpoints (❌ No Token Required)
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/access-levels/` | GET | List all users with their access levels |
-| `/access-levels/` | POST | Create new access level (use create_admin_manager instead) |
-| `/access-levels/{id}/` | GET | Get specific user access level |
-| `/access-levels/{id}/` | PUT | Update user access level |
-| `/access-levels/{id}/` | DELETE | Remove user access level |
-| `/access-levels/admins/` | GET | List all admin users |
-| `/access-levels/managers/` | GET | List all manager users |
+| `/auth/register/` | POST | Register new user |
+| `/token/` | POST | Get access & refresh tokens |
+| `/token/refresh/` | POST | Refresh access token |
 
 ### Employee Endpoints (✅ Token Required)
 
@@ -274,105 +190,6 @@ http://localhost:8000/api/
 
 ## 📌 Detailed Endpoint Documentation
 
-### ACCESS LEVEL ENDPOINTS (Admin Only)
-
-#### 1. List All Users with Access Levels
-```http
-GET /api/access-levels/
-Authorization: Bearer <admin_access_token>
-
-Response (200 OK):
-{
-    "count": 5,
-    "next": null,
-    "previous": null,
-    "results": [
-        {
-            "id": 1,
-            "user": 1,
-            "username": "admin_user",
-            "email": "admin@example.com",
-            "role": "admin",
-            "created_at": "2026-04-06T10:00:00Z",
-            "updated_at": "2026-04-06T10:00:00Z"
-        },
-        {
-            "id": 2,
-            "user": 2,
-            "username": "manager_user",
-            "email": "manager@example.com",
-            "role": "manager",
-            "created_at": "2026-04-06T11:00:00Z",
-            "updated_at": "2026-04-06T11:00:00Z"
-        }
-    ]
-}
-```
-
-#### 2. Get All Admin Users
-```http
-GET /api/access-levels/admins/
-Authorization: Bearer <admin_access_token>
-
-Response (200 OK):
-{
-    "count": 2,
-    "results": [
-        {
-            "id": 1,
-            "user": 1,
-            "username": "admin_user",
-            "email": "admin@example.com",
-            "role": "admin"
-        }
-    ]
-}
-```
-
-#### 3. Get All Manager Users
-```http
-GET /api/access-levels/managers/
-Authorization: Bearer <admin_access_token>
-
-Response (200 OK):
-{
-    "count": 3,
-    "results": [
-        {
-            "id": 2,
-            "user": 2,
-            "username": "manager_user",
-            "email": "manager@example.com",
-            "role": "manager"
-        }
-    ]
-}
-```
-
-#### 4. Update User Access Level
-```http
-PUT /api/access-levels/1/
-Authorization: Bearer <admin_access_token>
-Content-Type: application/json
-
-{
-    "role": "manager"
-}
-
-Response (200 OK):
-{
-    "id": 1,
-    "user": 1,
-    "username": "admin_user",
-    "email": "admin@example.com",
-    "role": "manager",
-    "created_at": "2026-04-06T10:00:00Z",
-    "updated_at": "2026-04-06T13:45:00Z"
-}
-```
-
----
-
 ### EMPLOYEE ENDPOINTS
 
 #### 1. Get All Employees
@@ -393,7 +210,8 @@ Response (200 OK):
     "results": [
         {
             "id": 1,
-            "emp_id": 1,
+            "emp_id": "EMP0001",
+            "user": 1,
             "username": "muazzam_ali",
             "email": "muazzam@example.com",
             "name": "Muazzam Ali",
@@ -403,7 +221,6 @@ Response (200 OK):
             "start_time": "06:00:00",
             "end_time": "14:00:00",
             "status": "active",
-            "date_joined": "2026-04-06",
             "total_hours_today": 8.5
         }
     ]
@@ -417,6 +234,7 @@ Authorization: Bearer <access_token>
 Content-Type: application/json
 
 {
+    "user": 1,
     "name": "John Doe",
     "salary": 65000,
     "hourly_rate": 406.25,
@@ -429,32 +247,31 @@ Content-Type: application/json
     "relative": "Ahmed Khan",
     "r_phone": "03008888888",
     "r_address": "Family Address",
-    "status": "active",
-    "date_joined": "2026-04-06"
+    "status": "active"
 }
 
 Response (201 Created):
 {
     "id": 2,
-    "emp_id": 2,
-    "username": null,
-    "email": null,
+    "emp_id": "EMP0002",
+    "user": 1,
+    "username": "john_doe",
+    "email": "john@example.com",
     "name": "John Doe",
     ...
 }
 ```
 
-**Note:** User field is removed from employee form. To link a user to an employee, create the user first via `/auth/register/` endpoint.
-
 #### 3. Get Employee Details
 ```http
-GET /api/employees/1/
+GET /api/employees/EMP0001/
 Authorization: Bearer <access_token>
 
 Response (200 OK):
 {
     "id": 1,
-    "emp_id": 1,
+    "emp_id": "EMP0001",
+    "user": 1,
     "username": "muazzam_ali",
     "name": "Muazzam Ali",
     "salary": "75000.00",
@@ -475,34 +292,14 @@ Response (200 OK):
 }
 ```
 
-#### 4. Update Employee
+#### 4. Calculate Payout
 ```http
-PUT /api/employees/1/
-Authorization: Bearer <access_token>
-Content-Type: application/json
-
-{
-    "name": "Muazzam Ali Updated",
-    "status": "active",
-    "date_joined": "2026-04-01"
-}
-
-Response (200 OK):
-{
-    "id": 1,
-    "emp_id": 1,
-    ...
-}
-```
-
-#### 5. Calculate Payout
-```http
-GET /api/employees/1/calculate_payout/?start_date=2026-03-01&end_date=2026-03-31
+GET /api/employees/EMP0001/calculate_payout/?start_date=2026-03-01&end_date=2026-03-31
 Authorization: Bearer <access_token>
 
 Response (200 OK):
 {
-    "employee_id": 1,
+    "employee_id": "EMP0001",
     "employee_name": "Muazzam Ali",
     "period": "2026-03-01 to 2026-03-31",
     "total_hours": 160,
@@ -511,9 +308,9 @@ Response (200 OK):
 }
 ```
 
-#### 6. Get Attendance Report
+#### 5. Get Attendance Report
 ```http
-GET /api/employees/1/attendance_report/?period=month
+GET /api/employees/EMP0001/attendance_report/?period=month
 Authorization: Bearer <access_token>
 
 Query Parameters:
@@ -523,7 +320,7 @@ Query Parameters:
 
 Response (200 OK):
 {
-    "employee_id": 1,
+    "employee_id": "EMP0001",
     "employee_name": "Muazzam Ali",
     "period": "2026-03-01 to 2026-03-31",
     "total_days_worked": 20,
@@ -534,16 +331,7 @@ Response (200 OK):
 }
 ```
 
-#### 7. Get Active Employees
-```http
-GET /api/employees/active_employees/
-Authorization: Bearer <access_token>
-
-Response (200 OK):
-[...]
-```
-
-#### 8. Get Employee Statistics
+#### 6. Employee Statistics
 ```http
 GET /api/employees/employee_stats/
 Authorization: Bearer <access_token>
@@ -567,7 +355,7 @@ GET /api/attendance/
 Authorization: Bearer <access_token>
 
 Query Parameters:
-- employee: 1
+- employee: EMP0001
 - date_from: 2026-03-01
 - date_to: 2026-03-31
 - status: on_time | late | absent | on_leave
@@ -586,7 +374,7 @@ POST /api/attendance/check_in/
 Content-Type: application/json
 
 {
-    "emp_id": 1
+    "emp_id": "EMP0001"
 }
 
 Response (201 Created):
@@ -594,7 +382,7 @@ Response (201 Created):
     "message": "Check-in successful",
     "record": {
         "id": 25,
-        "employee": 1,
+        "employee": "EMP0001",
         "employee_name": "Muazzam Ali",
         "date": "2026-04-06",
         "check_in": "2026-04-06T06:30:00Z",
@@ -615,7 +403,7 @@ POST /api/attendance/check_out/
 Content-Type: application/json
 
 {
-    "emp_id": 1
+    "emp_id": "EMP0001"
 }
 
 Response (200 OK):
@@ -623,7 +411,7 @@ Response (200 OK):
     "message": "Check-out successful",
     "record": {
         "id": 25,
-        "employee": 1,
+        "employee": "EMP0001",
         "employee_name": "Muazzam Ali",
         "date": "2026-04-06",
         "check_in": "2026-04-06T06:30:00Z",
@@ -697,7 +485,7 @@ Authorization: Bearer <access_token>
 Content-Type: application/json
 
 {
-    "employee": 1,
+    "employee": "EMP0001",
     "leave_type": "sick",
     "start_time": "2026-04-10T00:00:00Z",
     "end_time": "2026-04-12T23:59:59Z",
@@ -707,7 +495,7 @@ Content-Type: application/json
 Response (201 Created):
 {
     "id": 1,
-    "employee": 1,
+    "employee": "EMP0001",
     "employee_name": "Muazzam Ali",
     "leave_type": "sick",
     "start_time": "2026-04-10T00:00:00Z",
@@ -737,69 +525,6 @@ Response (200 OK):
     "leave": {...}
 }
 ```
-
-#### 3. Get Pending Approvals
-```http
-GET /api/leave/pending_approvals/
-Authorization: Bearer <access_token>
-
-Response (200 OK):
-{
-    "pending_count": 3,
-    "leaves": [...]
-}
-```
-
----
-
-### SHIFT ENDPOINTS
-
-#### 1. List All Shifts
-```http
-GET /api/shifts/
-Authorization: Bearer <access_token>
-
-Response (200 OK):
-{
-    "count": 3,
-    "results": [
-        {
-            "id": 1,
-            "name": "Morning Shift",
-            "start_time": "06:00:00",
-            "end_time": "14:00:00",
-            "description": "Early morning shift (6 AM - 2 PM)",
-            "created_at": "2026-04-06T13:45:00Z"
-        }
-    ]
-}
-```
-
-#### 2. Create Shift
-```http
-POST /api/shifts/
-Authorization: Bearer <access_token>
-Content-Type: application/json
-
-{
-    "name": "Flexible Shift",
-    "start_time": "09:00:00",
-    "end_time": "17:00:00",
-    "description": "Flexible working hours"
-}
-
-Response (201 Created):
-{
-    "id": 4,
-    "name": "Flexible Shift",
-    "start_time": "09:00:00",
-    "end_time": "17:00:00",
-    "description": "Flexible working hours",
-    "created_at": "2026-04-06T13:45:00Z"
-}
----
-
-## ⚠️ Error Responses
 
 #### 3. Get Pending Approvals
 ```http
@@ -942,20 +667,6 @@ curl -X POST http://localhost:8000/api/token/ \
   }'
 ```
 
-### Create Admin or Manager (Admin Only)
-```bash
-curl -X POST http://localhost:8000/api/auth/create_admin_manager/ \
-  -H "Authorization: Bearer <admin_access_token>" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "username": "new_manager",
-    "email": "manager@example.com",
-    "password": "pass123",
-    "first_name": "Ahmed",
-    "role": "manager"
-  }'
-```
-
 ### Refresh Token
 ```bash
 curl -X POST http://localhost:8000/api/token/refresh/ \
@@ -1026,55 +737,11 @@ const data = await response.json();
 const checkinResponse = await fetch('http://localhost:8000/api/attendance/check_in/', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ emp_id: 1 })
+    body: JSON.stringify({ emp_id: 'EMP0001' })
 });
 
 const checkinData = await checkinResponse.json();
 ```
-
-### Create Admin or Manager (Requires Admin Token)
-```javascript
-const createAdminResponse = await fetch('http://localhost:8000/api/auth/create_admin_manager/', {
-    method: 'POST',
-    headers: {
-        'Authorization': `Bearer ${adminAccessToken}`,
-        'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-        username: 'new_manager',
-        email: 'manager@example.com',
-        password: 'secure_password123',
-        first_name: 'Ahmed',
-        role: 'manager'
-    })
-});
-
-const adminData = await createAdminResponse.json();
-```
-
----
-
-## � Role-Based Access Control
-
-The system supports multiple user roles with different access levels:
-
-### Admin Role 🔐
-- **Permissions**: Full access
-- **Can Create**: Other admins and managers
-- **Can Access**: All endpoints including admin/manager creation and access level management
-- **Example**: System administrator or HR manager
-
-### Manager Role 📋
-- **Permissions**: Can manage employees and view reports
-- **Can Create**: Regular employees (via dashboard/forms)
-- **Cannot Create**: Other managers or admins
-- **Can Access**: Employee, attendance, leave, and shift endpoints
-
-### Employee Role 👤
-- **Permissions**: Limited access
-- **Can Create**: Leave requests
-- **Can Access**: Own attendance records, personal profile
-- **Public Access**: Check-in and check-out endpoints (no authentication required)
 
 ---
 
@@ -1082,13 +749,10 @@ The system supports multiple user roles with different access levels:
 
 1. **Access Token Lifetime**: 1 hour
 2. **Refresh Token Lifetime**: 7 days
-3. **Token Refresh**: Automatically rotates refresh tokens
-4. **Admin-Only Endpoint**: `/api/auth/create_admin_manager/` - Only admins can create new admins or managers
-5. **HTTPS Required**: Use HTTPS in production
-6. **Token Storage**: Store tokens securely (not in localStorage for sensitive apps)
-7. **CORS Enabled**: All origins allowed for development (change in production)
-8. **Date Format**: emp_id is now a simple integer (1, 2, 3, ...), not a formatted string
-9. **Employee Creation**: No longer requires linking to a user at creation time - user can be added separately
+3.  **Token Refresh**: Automatically rotates refresh tokens
+4. **HTTPS Required**: Use HTTPS in production
+5. **Token Storage**: Store tokens securely (not in localStorage for sensitive apps)
+6. **CORS Enabled**: All origins allowed for development (change in production)
 
 ---
 
@@ -1098,51 +762,27 @@ The system supports multiple user roles with different access levels:
 2. **Store tokens securely** in your application
 3. **Refresh tokens** before they expire
 4. **Don't share tokens** between users
-5. **Use Admin role sparingly** - limit the number of admins in the system
-6. **Manage roles carefully** - use the access level endpoints to update user roles
-7. **Logout by discarding** the token (server stateless)
-8. **Use Bearer token** format in Authorization header
-9. **Handle 401 responses** by refreshing or re-authenticating
-10. **Date Joined Field**: Is now editable - set appropriate joining dates when creating/updating employees
-
----
-
-## 🆕 What's New (Version 2.0 Updates)
-
-### Changes from Previous Version
-1. **Employee ID Format**: Changed from "EMP0001" to simple integers (1, 2, 3, ...)
-2. **User Field in Admin**: Removed user field from employee creation form - users are created separately
-3. **Date Joined**: Now editable field (was previously auto-generated)
-4. **Role-Based Access Control**: Added admin/manager/employee roles with different permissions
-5. **New Endpoints**:
-   - `POST /api/auth/create_admin_manager/` - Create admin or manager users
-   - `GET /api/auth/login/` - User login with role information
-   - `GET /api/access-levels/` - List all users with access levels (admin only)
-   - `GET /api/access-levels/admins/` - List all admin users (admin only)
-   - `GET /api/access-levels/managers/` - List all manager users (admin only)
-6. **Employee Creation**: Simplified - no user linking required at creation time
+5. **Logout by discarding** the token (server stateless)
+6. **Use Bearer token** format in Authorization header
+7. **Handle 401 responses** by refreshing or re-authenticating
 
 ---
 
 ## Testing Checklist
 
-- [ ] Register new employee user
-- [ ] Create admin user via create_admin_manager (as admin)
-- [ ] Create manager user via create_admin_manager (as admin)
-- [ ] Login and verify role information
+- [ ] Register new user
+- [ ] Get access token
 - [ ] Get employee list with token
-- [ ] Create new employee (date_joined is editable)
-- [ ] Update employee with new date_joined
-- [ ] Check-in/check-out without token
+- [ ] Refresh token
+- [ ] Check-in without token
+- [ ] Check-out without token
 - [ ] Create leave with token
 - [ ] Approve leave with token
-- [ ] List admins and managers
 - [ ] Test with expired token
 - [ ] Test with invalid token
-- [ ] Verify emp_id uses simple integers
 
 ---
 
-**Version**: 2.1 (Role-Based Access Control)  
+**Version**: 2.0 (JWT Authentication)  
 **Last Updated**: April 6, 2026  
 **Status**: ✅ Production Ready
