@@ -1,0 +1,145 @@
+[
+  {
+    "model": "management.shift",
+    "pk": 1,
+    "fields": {
+      "name": "Morning Shift",
+      "start_time": "06:00:00",
+      "end_time": "14:00:00",
+      "description": "Early morning shift (6 AM - 2 PM)",
+      "created_at": "2024-01-01T00:00:00Z"
+    }
+  },
+  {
+    "model": "management.shift",
+    "pk": 2,
+    "fields": {
+      "name": "Afternoon Shift",
+      "start_time": "14:00:00",
+      "end_time": "22:00:00",
+      "description": "Afternoon shift (2 PM - 10 PM)",
+      "created_at": "2024-01-01T00:00:00Z"
+    }
+  },
+  {
+    "model": "management.shift",
+    "pk": 3,
+    "fields": {
+      "name": "Night Shift",
+      "start_time": "22:00:00",
+      "end_time": "06:00:00",
+      "description": "Night shift (10 PM - 6 AM)",
+      "created_at": "2024-01-01T00:00:00Z"
+    }
+  },
+  {
+    "model": "management.employee",
+    "pk": "EMP001",
+    "fields": {
+      "name": "Muazzam Ali",
+      "profile_img": "",
+      "salary": "75000.00",
+      "hourly_rate": "468.75",
+      "shift_type": "morning",
+      "start_time": "06:00:00",
+      "end_time": "14:00:00",
+      "address": "123 Main Street, Lahore",
+      "phone": "03001234567",
+      "CNIC": "12345-1234567-1",
+      "relative": "Fatima Ali",
+      "r_phone": "03009876543",
+      "r_address": "Relative Address, Lahore",
+      "status": "active",
+      "date_joined": "2024-01-01",
+      "last_modified": "2024-01-01T00:00:00Z"
+    }
+  },
+  {
+    "model": "management.employee",
+    "pk": "EMP002",
+    "fields": {
+      "name": "Ayesha Khan",
+      "profile_img": "",
+      "salary": "65000.00",
+      "hourly_rate": "406.25",
+      "shift_type": "afternoon",
+      "start_time": "14:00:00",
+      "end_time": "22:00:00",
+      "address": "456 Park Road, Islamabad",
+      "phone": "03005555555",
+      "CNIC": "54321-7654321-2",
+      "relative": "Ahmed Khan",
+      "r_phone": "03008888888",
+      "r_address": "Family Address, Islamabad",
+      "status": "active",
+      "date_joined": "2024-01-01",
+      "last_modified": "2024-01-01T00:00:00Z"
+    }
+  },
+  {
+    "model": "management.employee",
+    "pk": "EMP003",
+    "fields": {
+      "name": "Hassan Malik",
+      "profile_img": "",
+      "salary": "55000.00",
+      "hourly_rate": "343.75",
+      "shift_type": "night",
+      "start_time": "22:00:00",
+      "end_time": "06:00:00",
+      "address": "789 City Center, Karachi",
+      "phone": "03003333333",
+      "CNIC": "11111-1111111-3",
+      "relative": "Zainab Malik",
+      "r_phone": "03004444444",
+      "r_address": "Contact Address, Karachi",
+      "status": "active",
+      "date_joined": "2024-01-01",
+      "last_modified": "2024-01-01T00:00:00Z"
+    }
+  },
+  {
+    "model": "management.employee",
+    "pk": "EMP004",
+    "fields": {
+      "name": "Saira Ahmed",
+      "profile_img": "",
+      "salary": "70000.00",
+      "hourly_rate": "437.50",
+      "shift_type": "morning",
+      "start_time": "06:00:00",
+      "end_time": "14:00:00",
+      "address": "321 Trade Center, Faisalabad",
+      "phone": "03006666666",
+      "CNIC": "99999-9999999-4",
+      "relative": "Mohammad Ahmed",
+      "r_phone": "03007777777",
+      "r_address": "Home Address, Faisalabad",
+      "status": "active",
+      "date_joined": "2024-01-01",
+      "last_modified": "2024-01-01T00:00:00Z"
+    }
+  },
+  {
+    "model": "management.employee",
+    "pk": "EMP005",
+    "fields": {
+      "name": "Ali Raza",
+      "profile_img": "",
+      "salary": "60000.00",
+      "hourly_rate": "375.00",
+      "shift_type": "afternoon",
+      "start_time": "14:00:00",
+      "end_time": "22:00:00",
+      "address": "654 Business Park, Rawalpindi",
+      "phone": "03002222222",
+      "CNIC": "88888-8888888-5",
+      "relative": "Noor Raza",
+      "r_phone": "03001111111",
+      "r_address": "Emergency Contact, Rawalpindi",
+      "status": "active",
+      "date_joined": "2024-01-01",
+      "last_modified": "2024-01-01T00:00:00Z"
+    }
+  }
+]

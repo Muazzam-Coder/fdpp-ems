@@ -1,0 +1,11 @@
+emp_id,name,salary,hourly_rate,shift_type,start_time,end_time,address,phone,CNIC,relative,r_phone,r_address,status
+EMP001,Muazzam Ali,75000,468.75,morning,06:00:00,14:00:00,123 Main Street Lahore,03001234567,12345-1234567-1,Fatima Ali,03009876543,Relative Address Lahore,active
+EMP002,Ayesha Khan,65000,406.25,afternoon,14:00:00,22:00:00,456 Park Road Islamabad,03005555555,54321-7654321-2,Ahmed Khan,03008888888,Family Address Islamabad,active
+EMP003,Hassan Malik,55000,343.75,night,22:00:00,06:00:00,789 City Center Karachi,03003333333,11111-1111111-3,Zainab Malik,03004444444,Contact Address Karachi,active
+EMP004,Saira Ahmed,70000,437.50,morning,06:00:00,14:00:00,321 Trade Center Faisalabad,03006666666,99999-9999999-4,Mohammad Ahmed,03007777777,Home Address Faisalabad,active
+EMP005,Ali Raza,60000,375.00,afternoon,14:00:00,22:00:00,654 Business Park Rawalpindi,03002222222,88888-8888888-5,Noor Raza,03001111111,Emergency Contact Rawalpindi,active
+EMP006,Zara Khan,72000,450.00,morning,06:00:00,14:00:00,987 Executive Plaza Peshawar,03337777777,22222-2222222-6,Khalid Khan,03335555555,Brother Address Peshawar,active
+EMP007,Omar Hassan,68000,425.00,afternoon,14:00:00,22:00:00,159 Business Hub Quetta,03081234567,33333-3333333-7,Sara Hassan,03089876543,Sister Address Quetta,active
+EMP008,Nida Islam,62000,387.50,night,22:00:00,06:00:00,753 Corporate Center Multan,03061111111,44444-4444444-8,Tariq Islam,03062222222,Cousin Address Multan,active
+EMP009,Kamran Ali,58000,362.50,morning,06:00:00,14:00:00,456 Trade Center Hyderabad,03003456789,55555-5555555-9,Maryam Ali,03008765432,Mother Address Hyderabad,active
+EMP010,Lisa Parker,67000,418.75,afternoon,14:00:00,22:00:00,321 Business Zone Gujranwala,03051234567,66666-6666666-10,James Parker,03055555555,Father Address Gujranwala,active
