@@ -1,0 +1,254 @@
+================================================================================
+                     FDPP EMS - TESTING GUIDE
+================================================================================
+
+Test these endpoints after starting all three components to verify system is working.
+
+================================================================================
+                    TEST 1: Server is Running
+================================================================================
+
+Command:
+  curl http://172.172.172.160:8000/api/employees/
+
+Expected Response:
+  HTTP 200 OK
+  {
+    "count": 2,
+    "next": null,
+    "previous": null,
+    "results": [
+      {
+        "emp_id": 1,
+        "name": "Muazzam Ali",
+        "email": "...",
+        "profile_picture": "http://...",
+        ...
+      }
+    ]
+  }
+
+================================================================================
+                    TEST 2: Login Endpoint
+================================================================================
+
+Command:
+  curl -X POST http://172.172.172.160:8000/api/auth/login/ \
+    -H "Content-Type: application/json" \
+    -d '{"username":"muazzam","password":"password"}'
+
+Expected Response:
+  HTTP 200 OK
+  {
+    "message": "Login successful",
+    "user_id": 1,
+    "username": "muazzam",
+    "email": "muazzam@example.com",
+    "first_name": "Muazzam",      ← NEW
+    "last_name": "Ali",            ← NEW
+    "role": "admin"
+  }
+
+================================================================================
+                    TEST 3: Access Levels Endpoint
+================================================================================
+
+Command:
+  curl http://172.172.172.160:8000/api/access-levels/ \
+    -H "Authorization: Bearer <token>"
+
+Expected Response:
+  HTTP 200 OK
+  {
+    "count": 1,
+    "results": [
+      {
+        "id": 1,
+        "user": 1,
+        "username": "muazzam",
+        "email": "muazzam@example.com",
+        "first_name": "Muazzam",      ← NEW
+        "last_name": "Ali",            ← NEW
+        "profile_img": "http://...",
+        "role": "admin",
+        "created_at": "2026-04-07T...",
+        "updated_at": "2026-04-07T..."
+      }
+    ]
+  }
+
+================================================================================
+                TEST 4: Biometric WebSocket (Manual Test)
+================================================================================
+
+In Browser Console:
+
+1. Connect to WebSocket:
+   const ws = new WebSocket('ws://172.172.172.160:8000/ws/biometric/');
+   ws.onopen = () => console.log('✓ Biometric WebSocket Connected');
+   ws.onmessage = (e) => console.log('Received:', JSON.parse(e.data));
+
+2. Send test scan (emp_id: 1):
+   ws.send(JSON.stringify({emp_id: 1}));
+
+3. Expected Response:
+   {
+     "type": "biometric_success",
+     "emp_id": 1,
+     "employee_name": "Muazzam Ali",
+     "action": "check_in",
+     "message": "⚠️ Muazzam Ali is 874 minutes late",
+     "is_late": true,
+     "check_in": "2026-04-07T20:34:18.272834+00:00",
+     "check_out": null,
+     "profile_img": "http://..."
+   }
+
+================================================================================
+                TEST 5: Attendance WebSocket (Dashboard)
+================================================================================
+
+In Browser Console:
+
+1. Connect to WebSocket:
+   const ws = new WebSocket('ws://172.172.172.160:8000/ws/attendance/');
+   ws.onopen = () => console.log('✓ Attendance WebSocket Connected');
+   ws.onmessage = (e) => console.log('Status:', JSON.parse(e.data));
+
+2. Query employee status:
+   ws.send(JSON.stringify({emp_id: 1, action: 'check_attendance'}));
+
+3. Expected Response:
+   {
+     "type": "attendance_info",
+     "emp_id": 1,
+     "name": "Muazzam Ali",
+     "profile_picture": "http://...",
+     "shift_type": "morning",
+     "shift_start": "06:00:00",
+     "shift_end": "14:00:00",
+     "check_in": "2026-04-07T20:34:18.272834+00:00",
+     "check_out": null,
+     "is_late": true,
+     "message": "⚠️ Muazzam Ali is 874 minutes late",
+     "last_status": "late",
+     "timestamp": "2026-04-07T20:33:00.754307+00:00"
+   }
+
+================================================================================
+              TEST 6: Auto Attendance (Biometric Trigger)
+================================================================================
+
+Command:
+  curl -X POST http://172.172.172.160:8000/api/attendance/auto_attendance/ \
+    -H "Content-Type: application/json" \
+    -d '{"emp_id": 1}'
+
+Expected Response (First scan of day - Check-in):
+  HTTP 200 OK
+  {
+    "message": "Attendance recorded",
+    "action": "check_in",
+    "record": {
+      "emp_id": 1,
+      "employee_name": "Muazzam Ali",
+      "check_in": "2026-04-07T20:34:18Z",
+      "check_out": null,
+      "is_late": true,
+      "late_message": "⚠️ 874 minutes late"
+    }
+  }
+
+(Send again for Check-out):
+  HTTP 200 OK
+  {
+    "message": "Attendance recorded",
+    "action": "check_out",
+    "record": {
+      "emp_id": 1,
+      "employee_name": "Muazzam Ali",
+      "check_in": "2026-04-07T06:00:00Z",
+      "check_out": "2026-04-07T20:34:18Z",
+      "total_hours": 14.57,
+      "is_late": true
+    }
+  }
+
+================================================================================
+                  TEST 7: Settings Configuration
+================================================================================
+
+In Python Terminal:
+
+& "d:\FDPP attendence\venv\Scripts\Activate.ps1"
+cd "d:\FDPP attendence\fdpp_ems"
+python manage.py shell
+  >>> from django.conf import settings
+  >>> settings.SERVER_IP
+  '172.172.172.160'
+  >>> settings.SERVER_PORT
+  8000
+  >>> settings.WEBSOCKET_URL
+  'ws://172.172.172.160:8000'
+  >>> exit()
+
+================================================================================
+                   MONITORING & LOGGING
+================================================================================
+
+Check Biometric Log:
+  tail -f d:\FDPP attendence\biometric_websocket.log
+
+Check Django Logs:
+  Terminal where Daphne is running - see console output
+
+Check Database:
+  cd d:\FDPP attendence\fdpp_ems
+  python manage.py shell
+  >>> from management.models import Attendance
+  >>> Attendance.objects.all().count()
+  >>> Attendance.objects.latest('created_at')
+
+================================================================================
+                  EXPECTED LOG MESSAGES
+================================================================================
+
+Django Server (Daphne):
+  2026-04-07 ... INFO Starting server at tcp:port=8000:interface=172.172.172.160
+  2026-04-07 ... INFO Listening on TCP address 172.172.172.160:8000
+  2026-04-07 ... INFO "GET /api/employees/" 200
+  2026-04-07 ... INFO "POST /api/auto_attendance/" 200
+
+Biometric Script:
+  2026-04-07 ... INFO FDPP EMS - ZK K40 Biometric WebSocket Integration Started
+  2026-04-07 ... INFO Device IP: 172.172.173.235:4370
+  2026-04-07 ... INFO WebSocket URL: ws://172.172.172.160:8000/ws/biometric/
+  2026-04-07 ... INFO Successfully connected to ZK K40 device...
+  2026-04-07 ... INFO WebSocket connected to ws://172.172.172.160:8000/ws/biometric/
+  2026-04-07 ... INFO 🔄 Starting Biometric Monitor Loop...
+  2026-04-07 ... INFO New Biometric Scan - Employee ID: 1, Time: ...
+
+Browser Console (WebSocket):
+  ✓ Connected to biometric WebSocket
+  Received: {type: "connection", message: "Connected to biometric service", ...}
+  Status: {type: "biometric_success", emp_id: 1, ...}
+
+================================================================================
+                     SUCCESS INDICATORS
+================================================================================
+
+✓ All tests passing if you see:
+  - Server responds on port 8000
+  - Login returns first_name and last_name
+  - Access levels include first_name and last_name
+  - WebSocket connects without errors
+  - Auto attendance creates records
+  - Biometric log shows "WebSocket connected"
+
+⚠️ Watch out for:
+  - Port 8000 already in use (kill old process)
+  - Device unreachable (check device IP and network)
+  - WebSocket timeout (firewall blocking port 8000)
+  - Django errors (run: python manage.py check)
+
+================================================================================

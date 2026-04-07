@@ -139,7 +139,7 @@ class Attendance(models.Model):
 
     class Meta:
         ordering = ['-date', '-check_in']
-        unique_together = [['employee', 'date']]
+        # Removed unique_together to allow multiple scans per day
         indexes = [
             models.Index(fields=['employee', 'date']),
             models.Index(fields=['date']),

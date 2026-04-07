@@ -27,6 +27,12 @@ DEBUG = True
 
 ALLOWED_HOSTS = ['172.172.172.160', 'localhost', '127.0.0.1','*']
 
+# ============ SERVER CONFIGURATION ============
+# System IP for WebSocket and other services
+SERVER_IP = '172.172.172.160'
+SERVER_PORT = 8000
+SERVER_URL = f'http://{SERVER_IP}:{SERVER_PORT}'
+WEBSOCKET_URL = f'ws://{SERVER_IP}:{SERVER_PORT}'
 
 # Application definition
 

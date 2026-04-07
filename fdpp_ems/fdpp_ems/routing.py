@@ -1,6 +1,9 @@
-from django.urls import re_path
-from management.consumers import AttendanceConsumer
+# WebSocket routing is now handled directly in asgi.py
+# This file is kept for reference only
 
-websocket_urlpatterns = [
-    re_path(r'ws/attendance/$', AttendanceConsumer.as_asgi()),
-]
+from django.urls import re_path, include
+from management.routing import websocket_urlpatterns
+
+# Not used - asgi.py imports consumers directly
+# websocket_urlpatterns = websocket_urlpatterns
+

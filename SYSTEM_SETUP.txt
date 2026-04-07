@@ -1,0 +1,225 @@
+================================================================================
+                    FDPP EMS - SYSTEM ARCHITECTURE
+================================================================================
+
+SYSTEM IP: 172.172.172.160
+SERVER PORT: 8000
+
+================================================================================
+                         THREE COMPONENTS
+================================================================================
+
+1. DJANGO SERVER (Daphne ASGI)
+   ├─ REST API for employee management
+   ├─ WebSocket for biometric device
+   └─ WebSocket for attendance UI
+   
+2. BIOMETRIC CONNECTOR (ZK K40 Device)
+   ├─ Polls device every 1 second
+   ├─ Sends scans to server via WebSocket
+   └─ Creates attendance records automatically
+   
+3. ATTENDANCE INTERFACE (Browser/Dashboard)
+   ├─ Connects via WebSocket
+   ├─ Queries employee status
+   └─ Receives real-time updates
+
+================================================================================
+                       QUICK START COMMANDS
+================================================================================
+
+TERMINAL 1 - Start Django Server:
+────────────────────────────────────────────────────────────────────────────
+& "d:\FDPP attendence\venv\Scripts\Activate.ps1"
+cd "d:\FDPP attendence\fdpp_ems"
+python -m daphne -b 172.172.172.160 -p 8000 fdpp_ems.asgi:application
+
+Expected: "Listening on TCP address 172.172.172.160:8000"
+
+TERMINAL 2 - Start Biometric Connector:
+────────────────────────────────────────────────────────────────────────────
+& "d:\FDPP attendence\venv\Scripts\Activate.ps1"
+cd "d:\FDPP attendence"
+python biometric_websocket.py
+
+Expected: "WebSocket connected to ws://172.172.172.160:8000/ws/biometric/"
+         "🔄 Starting Biometric Monitor Loop..."
+
+TERMINAL 3 - Attendance Interface (Browser):
+────────────────────────────────────────────────────────────────────────────
+Open browser console and run:
+
+// Connect to Attendance WebSocket
+const ws = new WebSocket('ws://172.172.172.160:8000/ws/attendance/');
+ws.onopen = () => console.log('✓ Connected');
+ws.onmessage = (e) => console.log('Data:', JSON.parse(e.data));
+
+// Query employee status
+ws.send(JSON.stringify({emp_id: 1, action: 'check_attendance'}));
+
+Expected: Connection message and employee status data
+
+================================================================================
+                        WEBSOCKET ENDPOINTS
+================================================================================
+
+🔵 BIOMETRIC CONNECTOR (Device Integration)
+   ws://172.172.172.160:8000/ws/biometric/
+   
+   Send: {"emp_id": 1}
+   Receive: {
+     "type": "biometric_success",
+     "emp_id": 1,
+     "employee_name": "Muazzam Ali",
+     "action": "check_in",
+     "is_late": false,
+     "check_in": "2026-04-07T...",
+     "profile_img": "http://..."
+   }
+
+🟢 ATTENDANCE INTERFACE (UI Updates)
+   ws://172.172.172.160:8000/ws/attendance/
+   
+   Send: {"emp_id": 1, "action": "check_attendance"}
+   Receive: {
+     "type": "attendance_info",
+     "emp_id": 1,
+     "name": "Muazzam Ali",
+     "shift_type": "morning",
+     "check_in": "2026-04-07T06:00:00Z",
+     "check_out": null,
+     "is_late": false,
+     "profile_picture": "http://..."
+   }
+
+================================================================================
+                         REST API ENDPOINTS
+================================================================================
+
+Authentication:
+  POST   /api/auth/register/          - Register employee
+  POST   /api/auth/login/             - Login (returns first_name, last_name, role)
+  POST   /api/auth/create_admin_manager/ - Create admin/manager (admin only)
+
+Employees:
+  GET    /api/employees/              - List all employees
+  GET    /api/employees/{emp_id}/     - Get employee details
+  POST   /api/employees/              - Create employee
+
+Attendance:
+  GET    /api/attendance/             - List attendance records
+  POST   /api/attendance/auto_attendance/ - Record attendance (emp_id)
+  GET    /api/attendance/attendance_report/ - Get attendance report
+
+Access Levels:
+  GET    /api/access-levels/          - List admin/managers (includes first_name, last_name)
+  GET    /api/access-levels/{id}/     - Get user role
+
+Login Response Example:
+{
+  "message": "Login successful",
+  "user_id": 1,
+  "username": "muazzam",
+  "email": "muazzam@example.com",
+  "first_name": "Muazzam",
+  "last_name": "Ali",
+  "role": "admin"
+}
+
+Access Level Response Example:
+{
+  "id": 1,
+  "user": 1,
+  "username": "muazzam",
+  "email": "muazzam@example.com",
+  "first_name": "Muazzam",
+  "last_name": "Ali",
+  "role": "admin",
+  "profile_img": "http://...",
+  "created_at": "...",
+  "updated_at": "..."
+}
+
+================================================================================
+                        CONFIGURATION FILES
+================================================================================
+
+Server IP is configured in:
+📄 fdpp_ems/settings.py
+
+  SERVER_IP = '172.172.172.160'
+  SERVER_PORT = 8000
+  WEBSOCKET_URL = f'ws://{SERVER_IP}:{SERVER_PORT}'
+
+Biometric script imports from settings:
+📄 biometric_websocket.py
+  
+  from django.conf import settings
+  SERVER_IP = settings.SERVER_IP
+  SERVER_PORT = settings.SERVER_PORT
+  WS_URL = f"ws://{SERVER_IP}:{SERVER_PORT}/ws/biometric/"
+
+================================================================================
+                           DATA FLOW
+================================================================================
+
+[ZK K40 Device] 
+    ↓ (polls every 1 sec)
+[Biometric Connector Script]
+    ↓ (sends emp_id via WebSocket)
+[Django Server] 
+    ├─ Creates Attendance record
+    ├─ Broadcasts to biometric WebSocket clients
+    └─ Returns response to device
+    ↓
+[Attendance Dashboard - Browser]
+    ├─ Receives real-time scan events
+    ├─ Queries employee status
+    └─ Updates UI in real-time
+
+================================================================================
+                        TROUBLESHOOTING
+================================================================================
+
+Port already in use:
+  Get-NetTCPConnection -LocalPort 8000
+  Stop-Process -Id <PID> -Force
+
+Biometric script won't connect:
+  1. Check Django server is running
+  2. Verify IP is 172.172.172.160 (settings.py)
+  3. Check logs in biometric_websocket.log
+  4. Verify device IP: 172.172.173.235:4370
+
+WebSocket error in browser:
+  1. Check firewall allows port 8000
+  2. Check browser console for errors
+  3. Verify Django server is running
+  4. Try http://172.172.172.160:8000/api/employees/ in browser first
+
+Django errors:
+  1. Run: python manage.py check
+  2. Run: python manage.py migrate
+  3. Check settings.py for syntax errors
+
+================================================================================
+                     PRODUCTION DEPLOYMENT
+================================================================================
+
+To deploy on different server:
+
+1. Update settings.py:
+   SERVER_IP = 'your.server.ip.address'
+
+2. Update ALLOWED_HOSTS:
+   ALLOWED_HOSTS = ['your.server.ip.address', 'localhost', ...]
+
+3. Update biometric device IP if needed:
+   DEVICE_IP = 'device.ip.address' (in biometric_websocket.py, line ~14)
+
+4. Start Daphne with server IP:
+   python -m daphne -b your.server.ip.address -p 8000 fdpp_ems.asgi:application
+
+5. All scripts will automatically use SERVER_IP from settings.py
+
+================================================================================

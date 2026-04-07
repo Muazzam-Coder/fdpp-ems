@@ -110,6 +110,8 @@ class AuthViewSet(viewsets.ViewSet):
                     "user_id": user.id,
                     "username": user.username,
                     "email": user.email,
+                    "first_name": user.first_name,
+                    "last_name": user.last_name,
                     "role": access_level.role
                 }, status=status.HTTP_200_OK)
             except UserAccessLevel.DoesNotExist:
@@ -121,6 +123,8 @@ class AuthViewSet(viewsets.ViewSet):
                         "user_id": user.id,
                         "username": user.username,
                         "email": user.email,
+                        "first_name": user.first_name,
+                        "last_name": user.last_name,
                         "emp_id": employee.emp_id,
                         "name": employee.name,
                         "role": "employee"
@@ -510,12 +514,16 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['post'], permission_classes=[AllowAny])
     def auto_attendance(self, request):
-        """Auto attendance - intelligently handles check-in/check-out based on last state
+        """Auto attendance - supports multiple check-in/check-out per day
         
         Logic:
-        - If no record today or last was "out": Create check-in
-        - If last was "in" and under 14 hours: Create check-out
-        - If last was "in" and over 14 hours: Create new check-in
+        - FIRST check-in and LAST check-out count for hours calculation
+        - Multiple scans allowed (e.g., lunch breaks)
+        - Intermediate scans are ignored for hour calculation
+        
+        Rules:
+        1. If no record today OR last record has check_out → Create new check-in
+        2. If last record has check_in but NO check_out → Create check-out
         """
         emp_id = request.data.get('emp_id')
         
@@ -537,27 +545,32 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         now = timezone.now()
         current_time = now.time()
         
-        # Get today's attendance record
-        today_attendance = Attendance.objects.filter(
+        # Get the LAST attendance record for today (to determine action)
+        last_attendance = Attendance.objects.filter(
             employee=employee,
             date=today
         ).order_by('-check_in').first()
         
-        # Determine action
-        action_type = None
-        message = None
+        # Get the FIRST check-in for today (for hour calculation)
+        first_checkin = Attendance.objects.filter(
+            employee=employee,
+            date=today
+        ).order_by('check_in').first()
         
-        if not today_attendance or (today_attendance.check_out and 
-                                     (now - today_attendance.check_out).total_seconds() >= 14 * 3600):
-            # Check-in action
-            action_type = 'check_in'
+        message = None
+        is_late = False
+        total_hours_today = 0
+        
+        # Determine action: Check-in or Check-out
+        if not last_attendance or (last_attendance.check_out is not None):
+            # ===== NEW CHECK-IN =====
+            action = 'check_in'
             
-            # Check if late
+            # Check if late based on shift start time
             shift_start = employee.start_time
             is_late = current_time > shift_start
             
             if is_late:
-                # Calculate minutes late
                 shift_start_datetime = timezone.make_aware(
                     datetime.combine(today, shift_start)
                 )
@@ -565,16 +578,15 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 message = f"You are {minutes_late} minutes late"
                 status_val = 'late'
             else:
-                message = None
                 status_val = 'on_time'
             
-            # Create check-in record
+            # Create new check-in record
             attendance = Attendance.objects.create(
                 employee=employee,
                 date=today,
                 check_in=now,
-                status=status_val,
-                message_late=message
+                message_late=message,
+                status=status_val
             )
             
             response_data = {
@@ -585,37 +597,43 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 "record": AttendanceSerializer(attendance).data
             }
             
-        elif today_attendance and today_attendance.check_in and not today_attendance.check_out:
-            # Check-out action
-            action_type = 'check_out'
+        elif last_attendance.check_in is not None and last_attendance.check_out is None:
+            # ===== CHECK-OUT =====
+            action = 'check_out'
             
-            # Validate 14-hour constraint
-            duration = (now - today_attendance.check_in).total_seconds() / 3600
+            # Validate 14-hour constraint from FIRST check-in
+            duration = (now - last_attendance.check_in).total_seconds() / 3600
             
             if duration > 14:
                 return Response(
                     {
                         "error": f"Cannot check out. Work duration ({duration:.2f} hours) exceeds 14-hour limit",
-                        "duration_hours": duration
+                        "duration_hours": round(duration, 2)
                     },
                     status=status.HTTP_400_BAD_REQUEST
                 )
             
-            today_attendance.check_out = now
-            today_attendance.save()
+            # Update the last check-in record with check-out time
+            last_attendance.check_out = now
+            last_attendance.save()
+            
+            # Calculate total hours using FIRST check-in and LAST check-out
+            if first_checkin:
+                total_duration = (now - first_checkin.check_in).total_seconds() / 3600
+                total_hours_today = round(min(total_duration, 14.0), 2)
             
             response_data = {
                 "message": "Check-out successful",
                 "action": "check_out",
-                "total_hours": today_attendance.total_hours,
-                "record": AttendanceSerializer(today_attendance).data
+                "total_hours_today": total_hours_today,
+                "record": AttendanceSerializer(last_attendance).data
             }
         
         else:
             return Response(
                 {
                     "error": "Invalid state. Cannot process attendance.",
-                    "last_record": AttendanceSerializer(today_attendance).data if today_attendance else None
+                    "last_record": AttendanceSerializer(last_attendance).data if last_attendance else None
                 },
                 status=status.HTTP_400_BAD_REQUEST
             )
