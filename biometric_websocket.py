@@ -6,7 +6,6 @@ Connects to ZK K40 device and sends real-time updates via WebSocket
 import os
 import sys
 import django
-import time
 import json
 import logging
 import asyncio
@@ -22,28 +21,26 @@ django.setup()
 from django.conf import settings
 
 # ============ CONFIGURATION ============
-DEVICE_IP = '172.172.173.235'  # Your ZK K40 device IP
-DEVICE_PORT = 4370             # ZK default port
-DEVICE_TIMEOUT = 10            # Connection timeout in seconds
+DEVICE_IP = '172.172.173.197'
+DEVICE_PORT = 4370
+DEVICE_TIMEOUT = 10
 
-# SERVER CONFIGURATION (WebSocket) - Imported from Django settings
+# SERVER CONFIGURATION
 SERVER_IP = settings.SERVER_IP
 SERVER_PORT = settings.SERVER_PORT
 WS_URL = f"ws://{SERVER_IP}:{SERVER_PORT}/ws/biometric/"
 
-# LOGGING CONFIGURATION
-LOG_FILE = 'biometric_websocket.log'
+# LOGGING - Set encoding to avoid emoji errors on Windows
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler()
+        logging.FileHandler('biometric_websocket.log', encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger(__name__)
 
-# ============ BIOMETRIC MONITOR WITH WEBSOCKET ============
 class BiometricMonitorWebSocket:
     def __init__(self, device_ip, device_port, ws_url, timeout=DEVICE_TIMEOUT):
         self.device_ip = device_ip
@@ -57,183 +54,123 @@ class BiometricMonitorWebSocket:
         self.max_retries = 5
         
     def connect_device(self):
-        """Establish connection to ZK K40 device"""
+        """Establish connection to ZK K40 device (Synchronous library)"""
         try:
             zk = ZK(self.device_ip, port=self.device_port, timeout=self.timeout)
             self.conn = zk.connect()
-            logger.info(f"✅ Successfully connected to ZK K40 device at {self.device_ip}:{self.device_port}")
-            self.retry_count = 0
+            logger.info(f"Connected to ZK K40 device at {self.device_ip}")
             return True
         except Exception as e:
-            self.retry_count += 1
-            logger.error(f"❌ Failed to connect to device: {str(e)} (Attempt {self.retry_count}/{self.max_retries})")
+            logger.error(f"Failed to connect to device: {str(e)}")
             return False
-
-    def disconnect_device(self):
-        """Safely disconnect from device"""
-        try:
-            if self.conn:
-                self.conn.disconnect()
-                logger.info("Device disconnected safely")
-        except Exception as e:
-            logger.error(f"Error during disconnect: {str(e)}")
 
     async def connect_websocket(self):
         """Establish WebSocket connection to server"""
         try:
             self.ws_conn = await websockets.connect(self.ws_url)
-            logger.info(f"✅ WebSocket connected to {self.ws_url}")
+            logger.info(f"WebSocket connected to {self.ws_url}")
             
             # Receive connection confirmation
             response = await self.ws_conn.recv()
-            logger.info(f"Server: {response}")
+            logger.info(f"Server says: {response}")
             return True
         except Exception as e:
-            logger.error(f"❌ WebSocket connection failed: {str(e)}")
+            logger.error(f"WebSocket connection failed: {str(e)}")
             return False
 
-    async def disconnect_websocket(self):
-        """Safely disconnect WebSocket"""
-        try:
-            if self.ws_conn:
-                await self.ws_conn.close()
-                logger.info("WebSocket disconnected safely")
-        except Exception as e:
-            logger.error(f"Error during WebSocket disconnect: {str(e)}")
-
     async def send_biometric_data(self, emp_id):
-        """Send employee ID to server via WebSocket"""
+        """Send employee ID to server via WebSocket and await response"""
         try:
-            payload = {
-                "emp_id": int(emp_id)
-            }
-            
-            if self.ws_conn:
-                # Send to server
-                await self.ws_conn.send(json.dumps(payload))
-                
-                # Receive response
-                response = await self.ws_conn.recv()
-                data = json.loads(response)
-                
-                if data.get('type') == 'biometric_success':
-                    action = data.get('action', 'unknown')
-                    emp_name = data.get('employee_name', 'Unknown')
-                    message = data.get('message', '')
-                    logger.info(f"{message}")
-                    return True, data
-                else:
-                    logger.error(f"❌ Error: {data.get('error', 'Unknown error')}")
-                    return False, data
-            else:
-                logger.error("❌ WebSocket not connected")
-                return False, "WebSocket not connected"
-                
-        except Exception as e:
-            logger.error(f"❌ Error sending biometric data: {str(e)}")
-            return False, str(e)
+            if not self.ws_conn:
+                logger.error("WebSocket not connected")
+                return False
 
-    def process_attendance(self):
-        """Get attendance logs from device and process new records"""
-        try:
-            attendance = self.conn.get_attendance()
-            current_count = len(attendance)
+            payload = {"emp_id": str(emp_id)}
+            await self.ws_conn.send(json.dumps(payload))
             
+            # Wait for the server to process attendance and return info
+            response = await self.ws_conn.recv()
+            data = json.loads(response)
+            
+            # If the response is a broadcast from group_send
+            if data.get('type') == 'biometric_attendance':
+                inner_data = data.get('data', {})
+                msg = inner_data.get('message', 'Attendance Processed')
+                logger.info(f"SUCCESS: {msg}")
+                return True
+            
+            return False
+        except Exception as e:
+            logger.error(f"Error sending data: {str(e)}")
+            return False
+
+    async def process_attendance(self):
+        """Fetch logs from device and trigger WebSocket send"""
+        try:
+            # get_attendance is a sync call, we run it in a thread to keep loop alive
+            loop = asyncio.get_event_loop()
+            attendance = await loop.run_in_executor(None, self.conn.get_attendance)
+            
+            current_count = len(attendance)
             if current_count > self.last_count:
                 new_records = attendance[self.last_count:]
-                
-                logger.info(f"📊 New scan detected: {len(new_records)} new record(s)")
+                logger.info(f"Detected {len(new_records)} new scan(s)")
                 
                 for log in new_records:
                     emp_id = log.user_id
-                    timestamp = log.timestamp
-                    
-                    logger.info(f"📱 New Biometric Scan - Employee ID: {emp_id}, Time: {timestamp}")
-                    
-                    # Send via WebSocket (non-blocking)
-                    try:
-                        asyncio.run(self.send_biometric_data(emp_id))
-                    except Exception as e:
-                        logger.warning(f"⚠️ Failed to send WebSocket data for ID {emp_id}: {str(e)}")
+                    # KEY FIX: We await the send_biometric_data here
+                    await self.send_biometric_data(emp_id)
                 
                 self.last_count = current_count
-                
         except Exception as e:
-            logger.error(f"❌ Error processing attendance: {str(e)}")
+            logger.error(f"Error processing logs: {str(e)}")
 
-    def initialize_count(self):
-        """Get initial attendance count to ignore old records"""
-        try:
-            attendance = self.conn.get_attendance()
-            self.last_count = len(attendance)
-            logger.info(f"📊 Initialized with {self.last_count} existing records")
-            return True
-        except Exception as e:
-            logger.error(f"❌ Error initializing count: {str(e)}")
-            return False
-
-    def monitor(self):
-        """Main monitoring loop (runs synchronously, WebSocket calls are async)"""
-        logger.info("🔄 Starting Biometric Monitor Loop...")
+    async def monitor_loop(self):
+        """Main async loop"""
+        logger.info("Starting Biometric Monitor Loop...")
         
-        # Connect to device
         if not self.connect_device():
-            return False
-        
-        # Initialize count
-        if not self.initialize_count():
-            self.disconnect_device()
-            return False
-        
-        try:
-            while True:
-                self.process_attendance()
-                time.sleep(1)  # Check every 1 second
-                
-        except KeyboardInterrupt:
-            logger.info("\n⏹️  Monitor stopped by user")
-            self.disconnect_device()
-            return True
-        except Exception as e:
-            logger.error(f"❌ Unexpected error in monitor loop: {str(e)}")
-            self.disconnect_device()
-            return False
+            return
 
+        # Initialize count
+        try:
+            init_logs = self.conn.get_attendance()
+            self.last_count = len(init_logs)
+            logger.info(f"Initialized. Ignoring {self.last_count} old records.")
+        except:
+            self.last_count = 0
+
+        while True:
+            try:
+                await self.process_attendance()
+                await asyncio.sleep(2) # Check every 2 seconds
+            except Exception as e:
+                logger.error(f"Loop error: {e}")
+                await asyncio.sleep(5)
 
 async def main():
-    """Main async function"""
-    logger.info("="*60)
-    logger.info("FDPP EMS - ZK K40 Biometric WebSocket Integration Started")
-    logger.info(f"Device IP: {DEVICE_IP}:{DEVICE_PORT}")
-    logger.info(f"WebSocket URL: {WS_URL}")
-    logger.info("="*60)
-    
     monitor = BiometricMonitorWebSocket(
         device_ip=DEVICE_IP,
         device_port=DEVICE_PORT,
-        ws_url=WS_URL,
-        timeout=DEVICE_TIMEOUT
+        ws_url=WS_URL
     )
     
-    # Connect WebSocket
+    # WebSocket Connection with auto-reconnect
     while True:
-        if await monitor.connect_websocket():
-            # Start monitoring
-            monitor.monitor()
-            await monitor.disconnect_websocket()
-        
-        if monitor.retry_count < monitor.max_retries:
-            wait_time = 5 * (monitor.retry_count + 1)
-            logger.info(f"⏳ Retrying WebSocket connection in {wait_time} seconds...")
-            await asyncio.sleep(wait_time)
-        else:
-            logger.critical("❌ Max retries exceeded. Please check device and server.")
-            break
-
+        try:
+            if await monitor.connect_websocket():
+                # Start the monitoring loop
+                await monitor.monitor_loop()
+        except (websockets.ConnectionClosed, Exception) as e:
+            logger.error(f"Connection lost: {e}. Retrying in 5s...")
+            await asyncio.sleep(5)
 
 if __name__ == "__main__":
+    # Fix for Windows loop policy
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        
     try:
         asyncio.run(main())
-    except Exception as e:
-        logger.critical(f"Critical error: {str(e)}")
-        raise
+    except KeyboardInterrupt:
+        logger.info("Stopped by user.")

@@ -156,14 +156,15 @@ class AttendanceConsumer(AsyncWebsocketConsumer):
                 "traceback": traceback.format_exc()
             }
 
-
 class BiometricConsumer(AsyncWebsocketConsumer):
     """WebSocket consumer for real-time biometric device events"""
     
     async def connect(self):
-        """Accept WebSocket connection from biometric device/script"""
+        """Accept WebSocket connection and join the group"""
+        # Join the shared group
         await self.channel_layer.group_add("biometric_device", self.channel_name)
         await self.accept()
+        
         await self.send(json.dumps({
             "type": "connection",
             "message": "Connected to biometric service",
@@ -171,23 +172,22 @@ class BiometricConsumer(AsyncWebsocketConsumer):
         }))
     
     async def disconnect(self, close_code):
-        """Handle disconnect"""
+        """Leave the group on disconnect"""
         await self.channel_layer.group_discard("biometric_device", self.channel_name)
     
     async def receive(self, text_data):
-        """Handle incoming biometric scan data"""
+        """
+        Handle data sent FROM the websocket client (if any).
+        If you scan from a script via WS, this processes it.
+        """
         try:
             data = json.loads(text_data)
             emp_id = data.get('emp_id')
-            
             if emp_id:
-                # Process the attendance and get response
+                # This calls your internal logic if the WS itself receives an ID
                 response = await self.process_biometric_scan(emp_id)
                 
-                # Send response back to this connection
-                await self.send(json.dumps(response))
-                
-                # Broadcast to all connected biometric listeners
+                # Broadcast the result to everyone in the group
                 await self.channel_layer.group_send(
                     "biometric_device",
                     {
@@ -195,23 +195,24 @@ class BiometricConsumer(AsyncWebsocketConsumer):
                         "data": response
                     }
                 )
-            else:
-                await self.send(json.dumps({
-                    "error": "emp_id is required"
-                }))
-        except json.JSONDecodeError:
-            await self.send(json.dumps({
-                "error": "Invalid JSON format"
-            }))
-    
+        except Exception as e:
+            await self.send(json.dumps({"error": str(e)}))
+
     async def biometric_event(self, event):
-        """Broadcast biometric event to connected clients"""
+        """
+        This method receives data from 'group_send' (from views.py or receive())
+        and sends it to the actual WebSocket client.
+        """
         data = event.get('data')
-        await self.send(json.dumps({
+        
+        # Send the message to the frontend client
+        await self.send(text_data=json.dumps({
             "type": "biometric_attendance",
             "data": data,
             "timestamp": timezone.now().isoformat()
         }))
+
+    # ... (keep your process_biometric_scan method below as it was) ...
     
     @database_sync_to_async
     def process_biometric_scan(self, emp_id):
