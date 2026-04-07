@@ -7,6 +7,10 @@ from django.dispatch import receiver
 from datetime import timedelta, datetime, time
 from decimal import Decimal
 
+def get_current_date():
+    """Get current date for default field value"""
+    return timezone.now().date()
+
 # User Access Level Model
 class UserAccessLevel(models.Model):
     ROLE_CHOICES = [
@@ -25,6 +29,20 @@ class UserAccessLevel(models.Model):
     
     def __str__(self):
         return f"{self.user.username} - {self.get_role_display()}"
+
+# User Profile Model (for admin/manager profile pictures)
+class UserProfile(models.Model):
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='profile')
+    profile_img = models.ImageField(upload_to='profiles/', null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        verbose_name = 'User Profile'
+        verbose_name_plural = 'User Profiles'
+    
+    def __str__(self):
+        return f"Profile - {self.user.username}"
 
 class Employee(models.Model):
     # Link to user authentication (optional)
@@ -55,7 +73,7 @@ class Employee(models.Model):
         choices=[('active', 'Active'), ('inactive', 'Inactive')],
         default='active'
     )
-    date_joined = models.DateField(default=lambda: timezone.now().date())  # Use date() to get just the date part
+    date_joined = models.DateField(default=get_current_date)
     last_modified = models.DateTimeField(auto_now=True)
 
     class Meta:

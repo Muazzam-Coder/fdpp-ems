@@ -10,12 +10,12 @@ from datetime import datetime
 from zk import ZK, const
 
 # ============ CONFIGURATION ============
-DEVICE_IP = '172.172.173.197'  # Your ZK K40 device IP
+DEVICE_IP = '172.172.173.199'  # Your ZK K40 device IP
 DEVICE_PORT = 4370             # ZK default port
 DEVICE_TIMEOUT = 10            # Connection timeout in seconds
 
 # SERVER CONFIGURATION
-SERVER_IP = '172.172.173.102'  # Your Django server IP
+SERVER_IP = '172.172.173.197'  # Your Django server IP
 SERVER_PORT = '8000'           # Your Django server port
 SERVER_URL = f"http://{SERVER_IP}:{SERVER_PORT}/api/attendance/auto_attendance/"
 

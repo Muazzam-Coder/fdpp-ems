@@ -87,20 +87,46 @@ class RegisterSerializer(serializers.Serializer):
 class UserAccessLevelSerializer(serializers.ModelSerializer):
     username = serializers.CharField(source='user.username', read_only=True)
     email = serializers.CharField(source='user.email', read_only=True)
+    profile_img = serializers.SerializerMethodField()
     
     class Meta:
         model = UserAccessLevel
-        fields = ['id', 'user', 'username', 'email', 'role', 'created_at', 'updated_at']
+        fields = ['id', 'user', 'username', 'email', 'profile_img', 'role', 'created_at', 'updated_at']
         read_only_fields = ['created_at', 'updated_at']
+    
+    def get_profile_img(self, obj):
+        """Get profile image from user profile or employee"""
+        try:
+            # First try UserProfile
+            if hasattr(obj.user, 'profile') and obj.user.profile.profile_img:
+                request = self.context.get('request')
+                if request:
+                    return request.build_absolute_uri(obj.user.profile.profile_img.url)
+                return obj.user.profile.profile_img.url
+        except (AttributeError, Exception):
+            pass
+        
+        try:
+            # Then try Employee profile
+            if obj.user.employee_profile and obj.user.employee_profile.profile_img:
+                request = self.context.get('request')
+                if request:
+                    return request.build_absolute_uri(obj.user.employee_profile.profile_img.url)
+                return obj.user.employee_profile.profile_img.url
+        except (AttributeError, Employee.DoesNotExist):
+            pass
+        
+        return None
 
 class CreateAdminManagerSerializer(serializers.Serializer):
-    """Serializer for creating admin or manager users"""
+    """Serializer for creating admin or manager users with optional profile image"""
     username = serializers.CharField(max_length=150)
     email = serializers.EmailField()
     password = serializers.CharField(write_only=True, min_length=8)
     first_name = serializers.CharField(max_length=150, required=False)
     last_name = serializers.CharField(max_length=150, required=False)
     role = serializers.ChoiceField(choices=['admin', 'manager'], default='manager')
+    profile_img = serializers.ImageField(required=False, allow_null=True)
     
     def validate_username(self, value):
         if User.objects.filter(username=value).exists():
@@ -113,9 +139,20 @@ class CreateAdminManagerSerializer(serializers.Serializer):
         return value
     
     def create(self, validated_data):
+        from .models import UserProfile
+        
         role = validated_data.pop('role')
+        profile_img = validated_data.pop('profile_img', None)
+        
         user = User.objects.create_user(**validated_data)
         UserAccessLevel.objects.update_or_create(user=user, defaults={'role': role})
+        
+        # Create user profile with image if provided
+        if profile_img:
+            UserProfile.objects.create(user=user, profile_img=profile_img)
+        else:
+            UserProfile.objects.create(user=user)
+        
         return user
 
 class ShiftSerializer(serializers.ModelSerializer):

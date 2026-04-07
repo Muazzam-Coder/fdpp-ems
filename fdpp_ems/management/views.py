@@ -64,19 +64,33 @@ class AuthViewSet(viewsets.ViewSet):
     
     @action(detail=False, methods=['post'], permission_classes=[IsAdmin])
     def create_admin_manager(self, request):
-        """Create a new admin or manager user (admin only)"""
+        """Create a new admin or manager user with optional profile image (admin only)"""
         serializer = CreateAdminManagerSerializer(data=request.data)
         if serializer.is_valid():
             user = serializer.save()
-            return Response({
+            
+            response_data = {
                 "message": f"User created successfully as {serializer.validated_data['role']}",
                 "user": {
                     "id": user.id,
                     "username": user.username,
                     "email": user.email,
-                    "role": serializer.validated_data['role']
+                    "first_name": user.first_name,
+                    "last_name": user.last_name,
+                    "role": serializer.validated_data['role'],
+                    "profile_img": None
                 }
-            }, status=status.HTTP_201_CREATED)
+            }
+            
+            # Add profile image URL if it exists
+            try:
+                user_profile = user.profile
+                if user_profile.profile_img:
+                    response_data["user"]["profile_img"] = request.build_absolute_uri(user_profile.profile_img.url)
+            except:
+                pass
+            
+            return Response(response_data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     
     @action(detail=False, methods=['post'])
@@ -155,11 +169,13 @@ class AttendanceFilter(filters.FilterSet):
         fields = ['employee', 'date_from', 'date_to', 'status']
 
 class EmployeeFilter(filters.FilterSet):
+    employee_id = filters.NumberFilter(field_name="emp_id", lookup_expr='exact')
+    employee_name = filters.CharFilter(field_name="name", lookup_expr='icontains')
     status = filters.CharFilter(field_name="status")
 
     class Meta:
         model = Employee
-        fields = ['status', 'shift_type']
+        fields = ['employee_id', 'employee_name', 'status', 'shift_type']
 
 class EmployeeViewSet(viewsets.ModelViewSet):
     queryset = Employee.objects.all()
