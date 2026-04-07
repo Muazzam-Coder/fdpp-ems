@@ -27,13 +27,6 @@ class UserAccessLevel(models.Model):
         return f"{self.user.username} - {self.get_role_display()}"
 
 class Employee(models.Model):
-    SHIFT_CHOICES = [
-        ('morning', 'Morning (6 AM - 2 PM)'),
-        ('afternoon', 'Afternoon (2 PM - 10 PM)'),
-        ('night', 'Night (10 PM - 6 AM)'),
-        ('flexible', 'Flexible'),
-    ]
-
     # Link to user authentication (optional)
     user = models.OneToOneField(User, on_delete=models.CASCADE, null=True, blank=True, related_name='employee_profile')
     
@@ -46,7 +39,7 @@ class Employee(models.Model):
     salary = models.DecimalField(max_digits=10, decimal_places=2, default=0.0)
     hourly_rate = models.DecimalField(max_digits=10, decimal_places=2, default=0.0)
     
-    shift_type = models.CharField(max_length=20, choices=SHIFT_CHOICES, default='morning') 
+    shift_type = models.CharField(max_length=100, default='morning')  # Allows custom shifts like "new" 
     start_time = models.TimeField() 
     end_time = models.TimeField()   
     address = models.TextField()
@@ -62,7 +55,7 @@ class Employee(models.Model):
         choices=[('active', 'Active'), ('inactive', 'Inactive')],
         default='active'
     )
-    date_joined = models.DateField(default=timezone.now)  # Changed from auto_now_add to editable
+    date_joined = models.DateField(default=lambda: timezone.now().date())  # Use date() to get just the date part
     last_modified = models.DateTimeField(auto_now=True)
 
     class Meta:

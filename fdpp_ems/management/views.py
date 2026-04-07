@@ -8,7 +8,7 @@ from .models import Employee, Attendance, PaidLeave, Shift, UserAccessLevel
 from .serializers import (
     EmployeeSerializer, AttendanceSerializer, PaidLeaveSerializer, 
     ShiftSerializer, UserSerializer, UserAccessLevelSerializer,
-    CreateAdminManagerSerializer
+    CreateAdminManagerSerializer, RegisterSerializer
 )
 from django.db.models import Sum, Count, Q, Avg
 from datetime import datetime, timedelta, date
@@ -33,27 +33,32 @@ class AuthViewSet(viewsets.ViewSet):
     
     @action(detail=False, methods=['post'])
     def register(self, request):
-        """Register a new user and create employee profile"""
-        serializer = UserSerializer(data=request.data)
+        """Register a new user and create employee profile with image upload"""
+        serializer = RegisterSerializer(data=request.data)
         if serializer.is_valid():
-            user = serializer.save()
-            # Create employee profile linked to user
-            employee = Employee.objects.create(
-                user=user,
-                name=request.data.get('first_name', user.username),
-                phone=request.data.get('phone', ''),
-                CNIC=request.data.get('CNIC', ''),
-                address=request.data.get('address', ''),
-                relative=request.data.get('relative', ''),
-                r_phone=request.data.get('r_phone', ''),
-                r_address=request.data.get('r_address', ''),
-                start_time=request.data.get('start_time', '09:00:00'),
-                end_time=request.data.get('end_time', '17:00:00'),
-            )
+            result = serializer.save()
+            user = result['user']
+            employee = result['employee']
+            
             return Response({
                 "message": "User registered successfully",
-                "user": UserSerializer(user).data,
-                "employee_id": employee.emp_id
+                "user": {
+                    "id": user.id,
+                    "username": user.username,
+                    "email": user.email,
+                    "first_name": user.first_name,
+                    "last_name": user.last_name
+                },
+                "employee": {
+                    "emp_id": employee.emp_id,
+                    "name": employee.name,
+                    "phone": employee.phone,
+                    "CNIC": employee.CNIC,
+                    "shift_type": employee.shift_type,
+                    "start_time": str(employee.start_time),
+                    "end_time": str(employee.end_time),
+                    "profile_img": employee.profile_img.url if employee.profile_img else None
+                }
             }, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     
@@ -165,7 +170,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     @action(detail=True, methods=['get'])
-    def calculate_payout(self, request, pk=None):
+    def calculate_payout(self, request, emp_id=None):
         """Calculates salary based on attendance and hourly rate."""
         employee = self.get_object()
         start_date = request.query_params.get('start_date')
@@ -204,7 +209,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         })
 
     @action(detail=True, methods=['get'])
-    def attendance_report(self, request, pk=None):
+    def attendance_report(self, request, emp_id=None):
         """Get attendance report for an employee with filters"""
         employee = self.get_object()
         period = request.query_params.get('period', 'month')  # day, week, month, custom
@@ -486,6 +491,120 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             },
             status=status.HTTP_200_OK
         )
+
+    @action(detail=False, methods=['post'], permission_classes=[AllowAny])
+    def auto_attendance(self, request):
+        """Auto attendance - intelligently handles check-in/check-out based on last state
+        
+        Logic:
+        - If no record today or last was "out": Create check-in
+        - If last was "in" and under 14 hours: Create check-out
+        - If last was "in" and over 14 hours: Create new check-in
+        """
+        emp_id = request.data.get('emp_id')
+        
+        if not emp_id:
+            return Response(
+                {"error": "emp_id is required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            employee = Employee.objects.get(emp_id=emp_id)
+        except Employee.DoesNotExist:
+            return Response(
+                {"error": f"Employee with id {emp_id} not found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        today = timezone.now().date()
+        now = timezone.now()
+        current_time = now.time()
+        
+        # Get today's attendance record
+        today_attendance = Attendance.objects.filter(
+            employee=employee,
+            date=today
+        ).order_by('-check_in').first()
+        
+        # Determine action
+        action_type = None
+        message = None
+        
+        if not today_attendance or (today_attendance.check_out and 
+                                     (now - today_attendance.check_out).total_seconds() >= 14 * 3600):
+            # Check-in action
+            action_type = 'check_in'
+            
+            # Check if late
+            shift_start = employee.start_time
+            is_late = current_time > shift_start
+            
+            if is_late:
+                # Calculate minutes late
+                shift_start_datetime = timezone.make_aware(
+                    datetime.combine(today, shift_start)
+                )
+                minutes_late = int((now - shift_start_datetime).total_seconds() / 60)
+                message = f"You are {minutes_late} minutes late"
+                status_val = 'late'
+            else:
+                message = None
+                status_val = 'on_time'
+            
+            # Create check-in record
+            attendance = Attendance.objects.create(
+                employee=employee,
+                date=today,
+                check_in=now,
+                status=status_val,
+                message_late=message
+            )
+            
+            response_data = {
+                "message": "Check-in successful",
+                "action": "check_in",
+                "is_late": is_late,
+                "late_message": message,
+                "record": AttendanceSerializer(attendance).data
+            }
+            
+        elif today_attendance and today_attendance.check_in and not today_attendance.check_out:
+            # Check-out action
+            action_type = 'check_out'
+            
+            # Validate 14-hour constraint
+            duration = (now - today_attendance.check_in).total_seconds() / 3600
+            
+            if duration > 14:
+                return Response(
+                    {
+                        "error": f"Cannot check out. Work duration ({duration:.2f} hours) exceeds 14-hour limit",
+                        "duration_hours": duration
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            today_attendance.check_out = now
+            today_attendance.save()
+            
+            response_data = {
+                "message": "Check-out successful",
+                "action": "check_out",
+                "total_hours": today_attendance.total_hours,
+                "record": AttendanceSerializer(today_attendance).data
+            }
+        
+        else:
+            return Response(
+                {
+                    "error": "Invalid state. Cannot process attendance.",
+                    "last_record": AttendanceSerializer(today_attendance).data if today_attendance else None
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        return Response(response_data, status=status.HTTP_200_OK)
 
 class PaidLeaveViewSet(viewsets.ModelViewSet):
     queryset = PaidLeave.objects.all().order_by('-start_time')
