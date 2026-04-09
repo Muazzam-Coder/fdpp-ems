@@ -166,7 +166,7 @@ class EmployeeSerializer(serializers.ModelSerializer):
     total_hours_today = serializers.ReadOnlyField()
     username = serializers.CharField(source='user.username', read_only=True, allow_null=True)
     email = serializers.CharField(source='user.email', read_only=True, allow_null=True)
-    profile_img = serializers.SerializerMethodField()
+    profile_img = serializers.ImageField(required=False, allow_null=True)
     
     class Meta:
         model = Employee

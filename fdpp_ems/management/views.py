@@ -13,6 +13,7 @@ from .serializers import (
 from django.db.models import Sum, Count, Q, Avg
 from datetime import datetime, timedelta, date
 from django.utils import timezone
+from fdpp_ems import settings
 
 # Permission check: Only admins can create admin/manager
 def is_admin(user):
