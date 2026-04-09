@@ -164,13 +164,17 @@ class Attendance(models.Model):
         """Calculate overtime if any - REMOVED"""
         return 0.0
     
+# management/models.py
+
     @property
     def is_late(self):
         """Check if employee was late"""
         if self.check_in:
-            shift_start = timezone.make_aware(datetime.combine(self.date, self.employee.start_time))
+            # REMOVED: timezone.make_aware
+            # UPDATED: Use simple datetime.combine for naive comparison
+            shift_start = datetime.combine(self.date, self.employee.start_time)
             return self.check_in > shift_start
-
+        return False
 class PaidLeave(models.Model):
     LEAVE_TYPE_CHOICES = [
         ('sick', 'Sick Leave'),

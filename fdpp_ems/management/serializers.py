@@ -238,14 +238,17 @@ class AttendanceSerializer(serializers.ModelSerializer):
                 )
         return data
     
+    # management/serializers.py
+
     def create(self, validated_data):
         check_in_time = validated_data.pop('check_in_time')
         check_out_time = validated_data.pop('check_out_time', None)
         date = validated_data.get('date')
         
-        # Combine date with times to create DateTimeField values
-        check_in = timezone.make_aware(datetime.combine(date, check_in_time))
-        check_out = timezone.make_aware(datetime.combine(date, check_out_time)) if check_out_time else None
+        # REMOVED: timezone.make_aware
+        # UPDATED: Use standard datetime.combine
+        check_in = datetime.combine(date, check_in_time)
+        check_out = datetime.combine(date, check_out_time) if check_out_time else None
         
         validated_data['check_in'] = check_in
         validated_data['check_out'] = check_out
@@ -257,10 +260,11 @@ class AttendanceSerializer(serializers.ModelSerializer):
         check_out_time = validated_data.pop('check_out_time', None)
         date = validated_data.get('date', instance.date)
         
+        # REMOVED: timezone.make_aware
         if check_in_time:
-            validated_data['check_in'] = timezone.make_aware(datetime.combine(date, check_in_time))
+            validated_data['check_in'] = datetime.combine(date, check_in_time)
         if check_out_time:
-            validated_data['check_out'] = timezone.make_aware(datetime.combine(date, check_out_time))
+            validated_data['check_out'] = datetime.combine(date, check_out_time)
         
         return super().update(instance, validated_data)
 
