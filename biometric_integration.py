@@ -10,7 +10,7 @@ from datetime import datetime
 from zk import ZK, const
 
 # ============ CONFIGURATION ============
-DEVICE_IP = '172.172.173.199'  # Your ZK K40 device IP
+DEVICE_IP = '172.172.173.197'  # Your ZK K40 device IP
 DEVICE_PORT = 4370             # ZK default port
 DEVICE_TIMEOUT = 10            # Connection timeout in seconds
 
