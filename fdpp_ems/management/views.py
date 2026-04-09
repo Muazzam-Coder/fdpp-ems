@@ -14,6 +14,8 @@ from django.db.models import Sum, Count, Q, Avg
 from datetime import datetime, timedelta, date
 from django.utils import timezone
 from fdpp_ems import settings
+from asgiref.sync import async_to_sync
+from channels.layers import get_channel_layer
 
 # Permission check: Only admins can create admin/manager
 def is_admin(user):
@@ -514,142 +516,8 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             status=status.HTTP_200_OK
         )
 
-    # @action(detail=False, methods=['post'], permission_classes=[AllowAny])
-    # def auto_attendance(self, request):
-    #     """Auto attendance - supports multiple check-in/check-out per day
-        
-    #     Logic:
-    #     - FIRST check-in and LAST check-out count for hours calculation
-    #     - Multiple scans allowed (e.g., lunch breaks)
-    #     - Intermediate scans are ignored for hour calculation
-        
-    #     Rules:
-    #     1. If no record today OR last record has check_out → Create new check-in
-    #     2. If last record has check_in but NO check_out → Create check-out
-    #     """
-    #     emp_id = request.data.get('emp_id')
-        
-    #     if not emp_id:
-    #         return Response(
-    #             {"error": "emp_id is required"},
-    #             status=status.HTTP_400_BAD_REQUEST
-    #         )
-
-    #     try:
-    #         employee = Employee.objects.get(emp_id=emp_id)
-    #     except Employee.DoesNotExist:
-    #         return Response(
-    #             {"error": f"Employee with id {emp_id} not found"},
-    #             status=status.HTTP_404_NOT_FOUND
-    #         )
-
-    #     today = timezone.now().date()
-    #     now = timezone.now()
-    #     current_time = now.time()
-        
-    #     # Get the LAST attendance record for today (to determine action)
-    #     last_attendance = Attendance.objects.filter(
-    #         employee=employee,
-    #         date=today
-    #     ).order_by('-check_in').first()
-        
-    #     # Get the FIRST check-in for today (for hour calculation)
-    #     first_checkin = Attendance.objects.filter(
-    #         employee=employee,
-    #         date=today
-    #     ).order_by('check_in').first()
-        
-    #     message = None
-    #     is_late = False
-    #     total_hours_today = 0
-        
-    #     # Determine action: Check-in or Check-out
-    #     if not last_attendance or (last_attendance.check_out is not None):
-    #         # ===== NEW CHECK-IN =====
-    #         action = 'check_in'
-            
-    #         # Check if late based on shift start time
-    #         shift_start = employee.start_time
-    #         is_late = current_time > shift_start
-            
-    #         if is_late:
-    #             shift_start_datetime = timezone.make_aware(
-    #                 datetime.combine(today, shift_start)
-    #             )
-    #             minutes_late = int((now - shift_start_datetime).total_seconds() / 60)
-    #             message = f"You are {minutes_late} minutes late"
-    #             status_val = 'late'
-    #         else:
-    #             status_val = 'on_time'
-            
-    #         # Create new check-in record
-    #         attendance = Attendance.objects.create(
-    #             employee=employee,
-    #             date=today,
-    #             check_in=now,
-    #             message_late=message,
-    #             status=status_val
-    #         )
-            
-    #         response_data = {
-    #             "message": "Check-in successful",
-    #             "action": "check_in",
-    #             "is_late": is_late,
-    #             "late_message": message,
-    #             "record": AttendanceSerializer(attendance).data
-    #         }
-            
-    #     elif last_attendance.check_in is not None and last_attendance.check_out is None:
-    #         # ===== CHECK-OUT =====
-    #         action = 'check_out'
-            
-    #         # Validate 14-hour constraint from FIRST check-in
-    #         duration = (now - last_attendance.check_in).total_seconds() / 3600
-            
-    #         if duration > 14:
-    #             return Response(
-    #                 {
-    #                     "error": f"Cannot check out. Work duration ({duration:.2f} hours) exceeds 14-hour limit",
-    #                     "duration_hours": round(duration, 2)
-    #                 },
-    #                 status=status.HTTP_400_BAD_REQUEST
-    #             )
-            
-    #         # Update the last check-in record with check-out time
-    #         last_attendance.check_out = now
-    #         last_attendance.save()
-            
-    #         # Calculate total hours using FIRST check-in and LAST check-out
-    #         if first_checkin:
-    #             total_duration = (now - first_checkin.check_in).total_seconds() / 3600
-    #             total_hours_today = round(min(total_duration, 14.0), 2)
-            
-    #         response_data = {
-    #             "message": "Check-out successful",
-    #             "action": "check_out",
-    #             "total_hours_today": total_hours_today,
-    #             "record": AttendanceSerializer(last_attendance).data
-    #         }
-        
-    #     else:
-    #         return Response(
-    #             {
-    #                 "error": "Invalid state. Cannot process attendance.",
-    #                 "last_record": AttendanceSerializer(last_attendance).data if last_attendance else None
-    #             },
-    #             status=status.HTTP_400_BAD_REQUEST
-    #         )
-        
-    #     return Response(response_data, status=status.HTTP_200_OK)
-    from asgiref.sync import async_to_sync
-    from channels.layers import get_channel_layer
-    from rest_framework.decorators import action
-    from rest_framework.response import Response
-    from rest_framework import status
-    from django.utils import timezone
-    from datetime import datetime
-
-# ... inside your AttendanceViewSet ...
+  
+    from datetime import datetime  # Make sure this is at the very top of views.py
 
     @action(detail=False, methods=['post'], permission_classes=[AllowAny])
     def auto_attendance(self, request):
@@ -663,16 +531,21 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         except Employee.DoesNotExist:
             return Response({"error": f"Employee with id {emp_id} not found"}, status=status.HTTP_404_NOT_FOUND)
 
-        today = timezone.now().date()
-        now = timezone.now()
+        # UPDATED: Use system clock time (since USE_TZ = False)
+        now = datetime.now() 
+        today = now.date()
         current_time = now.time()
         
         last_attendance = Attendance.objects.filter(employee=employee, date=today).order_by('-check_in').first()
         first_checkin = Attendance.objects.filter(employee=employee, date=today).order_by('check_in').first()
-        
-        message = None
-        is_late = False
-        total_hours_today = 0
+
+        attendance_info = {
+            "emp_id": employee.emp_id,
+            "employee_name": employee.name,
+            "profile_img": f"http://{settings.SERVER_IP}:{settings.SERVER_PORT}{employee.profile_img.url}" if employee.profile_img else None,
+            "shift_type": employee.shift_type,
+            "timestamp": now.strftime('%I:%M %p'), 
+        }
         
         # Determine action: Check-in or Check-out
         if not last_attendance or (last_attendance.check_out is not None):
@@ -680,80 +553,81 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             shift_start = employee.start_time
             is_late = current_time > shift_start
             
+            status_val = 'late' if is_late else 'on_time'
+            
+            late_msg = "On time"
             if is_late:
-                shift_start_datetime = timezone.make_aware(datetime.combine(today, shift_start))
-                minutes_late = int((now - shift_start_datetime).total_seconds() / 60)
-                message = f"You are {minutes_late} minutes late"
-                status_val = 'late'
-            else:
-                message = "On time"
-                status_val = 'on_time'
+                # UPDATED: No timezone awareness needed because USE_TZ = False
+                shift_start_dt = datetime.combine(today, shift_start)
+                minutes_late = int((now - shift_start_dt).total_seconds() / 60)
+                late_msg = f"{minutes_late} minutes late"
             
             attendance = Attendance.objects.create(
                 employee=employee,
                 date=today,
-                check_in=now,
-                message_late=message,
+                check_in=now, # Saves literal system time to DB
+                message_late=late_msg,
                 status=status_val
             )
             
-            response_data = {
-                "message": "Check-in successful",
-                "action": "check_in",
+            action = "check_in"
+            message = "Check-in successful"
+            attendance_info.update({
+                "action": action,
+                "check_in": now.strftime('%I:%M %p'),
+                "check_out": "--:--",
                 "is_late": is_late,
-                "late_message": message,
-                "record": AttendanceSerializer(attendance).data
-            }
+                "late_message": late_msg,
+                "total_hours_today": 0
+            })
             
         elif last_attendance.check_in is not None and last_attendance.check_out is None:
             # ===== CHECK-OUT =====
+            # Both are now "naive" datetimes, so math works perfectly
             duration = (now - last_attendance.check_in).total_seconds() / 3600
-            
             if duration > 14:
-                return Response({
-                    "error": f"Work duration ({duration:.2f} hours) exceeds 14-hour limit"
-                }, status=status.HTTP_400_BAD_REQUEST)
+                return Response({"error": "Duration exceeds 14-hour limit"}, status=status.HTTP_400_BAD_REQUEST)
             
-            last_attendance.check_out = now
+            last_attendance.check_out = now # Saves literal system time to DB
             last_attendance.save()
             
+            total_hours = 0
             if first_checkin:
                 total_duration = (now - first_checkin.check_in).total_seconds() / 3600
-                total_hours_today = round(min(total_duration, 14.0), 2)
+                total_hours = round(min(total_duration, 14.0), 2)
             
-            response_data = {
-                "message": "Check-out successful",
-                "action": "check_out",
-                "total_hours_today": total_hours_today,
-                "record": AttendanceSerializer(last_attendance).data
-            }
-        else:
-            return Response({"error": "Invalid state"}, status=status.HTTP_400_BAD_REQUEST)
+            action = "check_out"
+            message = "Check-out successful"
+            attendance_info.update({
+                "action": action,
+                # UPDATED: Just use the time in DB directly (it's already local)
+                "check_in": last_attendance.check_in.strftime('%I:%M %p'),
+                "check_out": now.strftime('%I:%M %p'),
+                "is_late": False,
+                "late_message": None,
+                "total_hours_today": total_hours
+            })
 
-        # ============================================================
-        # NEW: BROADCAST TO WEBSOCKET
-        # ============================================================
+        response_payload = {
+            "message": message,
+            "action": action,
+            "data": attendance_info
+        }
+
+        # Broadcast to WebSocket
         try:
             channel_layer = get_channel_layer()
             async_to_sync(channel_layer.group_send)(
-                "biometric_device",  # This must match the group name in consumers.py
+                "biometric_device",
                 {
-                    "type": "biometric_event",  # This must match the method name in consumers.py
-                    "data": {
-                        **response_data,
-                        "emp_id": employee.emp_id,
-                        "employee_name": employee.name,
-                        "profile_img": employee.profile_img.url if employee.profile_img else None,
-                        "timestamp": now.isoformat()
-                    }
+                    "type": "biometric_event",
+                    "data": attendance_info 
                 }
             )
         except Exception as e:
-            print(f"WebSocket Broadcast Error: {e}") 
-            # We don't return an error response here so the DB transaction isn't affected 
-            # if the websocket fails.
+            print(f"WS Error: {e}")
 
-        return Response(response_data, status=status.HTTP_200_OK)
+        return Response(response_payload, status=status.HTTP_200_OK)
 
 class PaidLeaveViewSet(viewsets.ModelViewSet):
     queryset = PaidLeave.objects.all().order_by('-start_time')

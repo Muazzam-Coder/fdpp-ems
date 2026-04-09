@@ -83,10 +83,23 @@ WSGI_APPLICATION = 'fdpp_ems.wsgi.application'
 ASGI_APPLICATION = 'fdpp_ems.asgi.application'
 
 # Channels configuration
+# CHANNEL_LAYERS = {
+#     'default': {
+#         'BACKEND': 'channels.layers.InMemoryChannelLayer'
+#     }
+# }
+
+
+
+
+
 CHANNEL_LAYERS = {
     'default': {
-        'BACKEND': 'channels.layers.InMemoryChannelLayer'
-    }
+        'BACKEND': 'channels_redis.core.RedisChannelLayer',
+        'CONFIG': {
+            "hosts": [('127.0.0.1', 6379)], # Change to your Redis IP if different
+        },
+    },
 }
 
 
@@ -125,12 +138,13 @@ AUTH_PASSWORD_VALIDATORS = [
 
 LANGUAGE_CODE = 'en-us'
 
-TIME_ZONE = 'UTC'
+TIME_ZONE = 'Asia/Karachi'
 
-USE_I18N = True
+USE_I18N = False
 
-USE_TZ = True
-
+# Keep this True to handle daylight savings and database accuracy, 
+# but Django will now convert everything to Karachi time for you.
+USE_TZ = False
 
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
