@@ -21,14 +21,15 @@ django.setup()
 from django.conf import settings
 
 # ============ CONFIGURATION ============
-DEVICE_IP = '172.172.173.197'
+DEVICE_IP = '172.172.173.199'
 DEVICE_PORT = 4370
 DEVICE_TIMEOUT = 10
 
 # SERVER CONFIGURATION
 SERVER_IP = settings.SERVER_IP
 SERVER_PORT = settings.SERVER_PORT
-WS_URL = f"ws://{SERVER_IP}:{SERVER_PORT}/ws/biometric/"
+WS_URL = f"ws://172.172.173.197:8000/ws/biometric/"
+# WS_URL = f"ws://{SERVER_IP}:{SERVER_PORT}/ws/biometric/"
 
 # LOGGING - Set encoding to avoid emoji errors on Windows
 logging.basicConfig(
@@ -85,7 +86,7 @@ class BiometricMonitorWebSocket:
                 logger.error("WebSocket not connected")
                 return False
 
-            payload = {"emp_id": str(emp_id)}
+            payload = {"emp_id": emp_id}
             await self.ws_conn.send(json.dumps(payload))
             
             # Wait for the server to process attendance and return info
