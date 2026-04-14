@@ -26,7 +26,7 @@ django_asgi_app = get_asgi_application()
 from management import consumers
 
 websocket_urlpatterns = [
-    re_path(r'ws/attendance/$', consumers.AttendanceConsumer.as_asgi()),
+    # re_path(r'ws/attendance/$', consumers.AttendanceConsumer.as_asgi()),
     re_path(r'ws/biometric/$', consumers.BiometricConsumer.as_asgi()),
 ]
 

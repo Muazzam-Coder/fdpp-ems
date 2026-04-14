@@ -10,27 +10,49 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
+import os
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
+def load_env_file(env_path: Path) -> None:
+    if not env_path.exists():
+        return
+
+    with env_path.open('r', encoding='utf-8') as env_file:
+        for raw_line in env_file:
+            line = raw_line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+
+            key, value = line.split('=', 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+load_env_file(BASE_DIR.parent / '.env')
+
+
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-(p2krps2z*kc$0s1_ink@4)0&@e$m=yg(ulhe(ekecznw580#s'
+SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-(p2krps2z*kc$0s1_ink@4)0&@e$m=yg(ulhe(ekecznw580#s')
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ['172.172.172.160', 'localhost', '127.0.0.1','*']
+SERVER_IP = os.environ['SERVER_IP']
+SERVER_PORT = int(os.environ['SERVER_PORT'])
+
+ALLOWED_HOSTS = [SERVER_IP, 'localhost', '127.0.0.1', '*']
 
 # ============ SERVER CONFIGURATION ============
 # System IP for WebSocket and other services
-SERVER_IP = '172.172.172.160'
-SERVER_PORT = 8000
 SERVER_URL = f'http://{SERVER_IP}:{SERVER_PORT}'
 WEBSOCKET_URL = f'ws://{SERVER_IP}:{SERVER_PORT}'
 
