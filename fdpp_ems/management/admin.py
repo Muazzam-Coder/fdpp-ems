@@ -23,16 +23,16 @@ class UserAccessLevelAdmin(admin.ModelAdmin):
 
 @admin.register(Employee)
 class EmployeeAdmin(admin.ModelAdmin):
-    list_display = ['emp_id', 'name', 'shift_type', 'status', 'date_joined']
-    list_filter = ['status', 'shift_type', 'date_joined']
-    search_fields = ['emp_id', 'name', 'CNIC', 'phone']
+    list_display = ['emp_id', 'name', 'designation', 'shift_type', 'status', 'date_joined']
+    list_filter = ['status', 'designation', 'shift_type', 'date_joined']
+    search_fields = ['emp_id', 'name', 'designation', 'CNIC', 'phone']
     readonly_fields = ['emp_id', 'last_modified']
     fieldsets = (
         ('Employee ID', {
             'fields': ['emp_id']
         }),
         ('Personal Information', {
-            'fields': ['name', 'profile_img', 'address', 'phone', 'CNIC']
+            'fields': ['name', 'designation', 'profile_img', 'address', 'phone', 'CNIC']
         }),
         ('Emergency Contact', {
             'fields': ['relative', 'r_phone', 'r_address']

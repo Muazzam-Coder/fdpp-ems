@@ -50,30 +50,33 @@ class Employee(models.Model):
     
     # Simple integer emp_id (1, 2, 3, etc.)
     emp_id = models.IntegerField(unique=True, editable=False, db_index=True)
-    name = models.CharField(max_length=255)
+    name = models.CharField(max_length=255, null=True, blank=True)
+    designation = models.CharField(max_length=255, null=True, blank=True)
     profile_img = models.ImageField(upload_to='profiles/', null=True, blank=True)
     
     # Financial fields for payout calculations
-    salary = models.DecimalField(max_digits=10, decimal_places=2, default=0.0)
-    hourly_rate = models.DecimalField(max_digits=10, decimal_places=2, default=0.0)
+    salary = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, default=None)
+    hourly_rate = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, default=None)
     
-    shift_type = models.CharField(max_length=100, default='morning')  # Allows custom shifts like "new" 
-    start_time = models.TimeField() 
-    end_time = models.TimeField()   
-    address = models.TextField()
-    phone = models.CharField(max_length=20)
-    CNIC = models.CharField(max_length=20, unique=True)
-    relative = models.CharField(max_length=255)
-    r_phone = models.CharField(max_length=20)
-    r_address = models.TextField()
+    shift_type = models.CharField(max_length=100, null=True, blank=True, default='morning')  # Allows custom shifts like "new" 
+    start_time = models.TimeField(null=True, blank=True)
+    end_time = models.TimeField(null=True, blank=True)   
+    address = models.TextField(null=True, blank=True)
+    phone = models.CharField(max_length=20, null=True, blank=True)
+    CNIC = models.CharField(max_length=20, unique=True, null=True, blank=True)
+    relative = models.CharField(max_length=255, null=True, blank=True)
+    r_phone = models.CharField(max_length=20, null=True, blank=True)
+    r_address = models.TextField(null=True, blank=True)
     
     # Additional fields - date_joined is now editable
     status = models.CharField(
         max_length=20,
         choices=[('active', 'Active'), ('inactive', 'Inactive')],
-        default='active'
+        default='active',
+        null=True,
+        blank=True,
     )
-    date_joined = models.DateField(default=get_current_date)
+    date_joined = models.DateField(null=True, blank=True, default=None)
     last_modified = models.DateTimeField(auto_now=True)
 
     class Meta:

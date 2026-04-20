@@ -25,6 +25,56 @@ def is_admin(user):
     except (AttributeError, UserAccessLevel.DoesNotExist):
         return False
 
+
+def format_hours_display(hours_value):
+    if hours_value is None:
+        return '0h 0m'
+
+    total_minutes = max(0, int(round(float(hours_value) * 60)))
+    hours, minutes = divmod(total_minutes, 60)
+    return f'{hours}h {minutes}m'
+
+
+def build_absent_entries(report_date, request=None):
+    """Build synthetic absent rows for active employees who missed the shift."""
+    current_time = datetime.now().time()
+    today = timezone.now().date()
+
+    active_employees = Employee.objects.filter(status='active')
+    attendances = Attendance.objects.filter(date=report_date)
+    present_employee_ids = set(attendances.values_list('employee', flat=True).distinct())
+
+    absent_entries = []
+    pending_count = 0
+
+    for employee in active_employees:
+        if employee.emp_id in present_employee_ids:
+            continue
+
+        if not employee.start_time or not employee.end_time:
+            pending_count += 1
+            continue
+
+        if report_date < today or (report_date == today and current_time >= employee.end_time):
+            absent_entries.append({
+                "id": None,
+                "employee": employee.emp_id,
+                "employee_name": employee.name,
+                "date": report_date,
+                "check_in": None,
+                "check_out": None,
+                "message_late": None,
+                "status": "absent",
+                "total_hours": "0h 0m",
+                "is_late": False,
+                "created_at": None,
+                "updated_at": None,
+            })
+        else:
+            pending_count += 1
+
+    return absent_entries, pending_count
+
 class IsAdmin(IsAuthenticated):
     """Permission class for admin access"""
     def has_permission(self, request, view):
@@ -55,11 +105,12 @@ class AuthViewSet(viewsets.ViewSet):
                 "employee": {
                     "emp_id": employee.emp_id,
                     "name": employee.name,
+                    "designation": employee.designation,
                     "phone": employee.phone,
                     "CNIC": employee.CNIC,
                     "shift_type": employee.shift_type,
-                    "start_time": str(employee.start_time),
-                    "end_time": str(employee.end_time),
+                    "start_time": employee.start_time.strftime('%H:%M:%S') if employee.start_time else None,
+                    "end_time": employee.end_time.strftime('%H:%M:%S') if employee.end_time else None,
                     # "profile_img": employee.profile_img.url if employee.profile_img else None
                     "profile_img": f"http://{settings.SERVER_IP}:{settings.SERVER_PORT}{employee.profile_img.url}" if employee.profile_img else None
                 }
@@ -193,6 +244,10 @@ class EmployeeViewSet(viewsets.ModelViewSet):
     lookup_field = 'emp_id'  # Use emp_id for URL lookups like /employees/EMP001/
     permission_classes = [IsAuthenticated]
 
+    def update(self, request, *args, **kwargs):
+        kwargs['partial'] = True
+        return super().update(request, *args, **kwargs)
+
     @action(detail=True, methods=['get'])
     def calculate_payout(self, request, emp_id=None):
         """Calculates salary based on attendance and hourly rate."""
@@ -220,15 +275,16 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             date__range=[start_date, end_date]
         )
         
-        total_worked_hours = sum(att.total_hours for att in attendances)
-        payout = float(total_worked_hours) * float(employee.hourly_rate)
+        total_worked_hours = round(sum(att.total_hours for att in attendances), 2)
+        payout = float(total_worked_hours) * float(employee.hourly_rate or 0)
 
         return Response({
             "employee_id": employee.emp_id,
             "employee_name": employee.name,
             "period": f"{start_date} to {end_date}",
-            "total_hours": total_worked_hours,
-            "hourly_rate": float(employee.hourly_rate),
+            "total_hours": format_hours_display(total_worked_hours),
+            "total_hours_value": total_worked_hours,
+            "hourly_rate": float(employee.hourly_rate or 0),
             "total_payout": float(payout)
         })
 
@@ -279,7 +335,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             date__range=[start_date, end_date]
         ).order_by('-date')
 
-        total_hours = sum(att.total_hours for att in attendances)
+        total_hours = round(sum(att.total_hours for att in attendances), 2)
         total_days = attendances.count()
         late_count = attendances.filter(status='late').count()
         on_time_count = attendances.filter(status='on_time').count()
@@ -289,7 +345,8 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             "employee_name": employee.name,
             "period": f"{start_date} to {end_date}",
             "total_days_worked": total_days,
-            "total_hours": total_hours,
+            "total_hours": format_hours_display(total_hours),
+            "total_hours_value": total_hours,
             "on_time": on_time_count,
             "late": late_count,
             "attendance_records": AttendanceSerializer(attendances, many=True).data
@@ -326,6 +383,43 @@ class AttendanceViewSet(viewsets.ModelViewSet):
     filterset_class = AttendanceFilter
     permission_classes = [IsAuthenticated]
 
+    def list(self, request, *args, **kwargs):
+        """Return today's attendance by default, plus synthetic absent rows after shift end."""
+        date_str = request.query_params.get('date')
+        today = timezone.now().date()
+
+        if not date_str:
+            report_date = today
+        else:
+            try:
+                report_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+            except ValueError:
+                return Response({"error": "Invalid date format"}, status=status.HTTP_400_BAD_REQUEST)
+
+        attendances = Attendance.objects.filter(date=report_date).order_by('employee', 'check_in')
+        serializer = AttendanceSerializer(attendances, many=True, context={'request': request})
+        absent_entries, pending_count = build_absent_entries(report_date, request=request)
+
+        results = list(serializer.data) + absent_entries
+        present_count = attendances.values('employee').distinct().count()
+        absent_count = len(absent_entries)
+        late_count = attendances.filter(status='late').values('employee').distinct().count()
+        on_time_count = max(0, present_count - late_count)
+        total_hours = round(sum(att.total_hours for att in attendances), 2)
+
+        return Response({
+            "date": report_date,
+            "present": present_count,
+            "absent": absent_count,
+            "pending": pending_count,
+            "on_time": on_time_count,
+            "late": late_count,
+            "total_hours": format_hours_display(total_hours),
+            "total_hours_value": total_hours,
+            "count": len(results),
+            "results": results,
+        })
+
 
     @action(detail=False, methods=['get'])
     def daily_report(self, request):
@@ -346,9 +440,41 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         
         # FIX: Count UNIQUE employees present today
         present_count = attendances.values('employee').distinct().count()
-        
-        # FIX: Calculate absent correctly
-        absent_count = max(0, total_active_employees - present_count)
+        total_hours = round(sum(att.total_hours for att in attendances), 2)
+
+        active_employees = Employee.objects.filter(status='active')
+        present_employee_ids = set(attendances.values_list('employee', flat=True).distinct())
+        absent_details = []
+        pending_count = 0
+        current_time = datetime.now().time()
+
+        for employee in active_employees:
+            if employee.emp_id in present_employee_ids:
+                continue
+
+            if not employee.start_time or not employee.end_time:
+                pending_count += 1
+                continue
+
+            if report_date < today or (report_date == today and current_time >= employee.end_time):
+                absent_details.append({
+                    "id": None,
+                    "employee": employee.emp_id,
+                    "employee_name": employee.name,
+                    "date": report_date,
+                    "check_in": None,
+                    "check_out": None,
+                    "message_late": None,
+                    "status": "absent",
+                    "total_hours": "0h 0m",
+                    "is_late": False,
+                    "created_at": None,
+                    "updated_at": None,
+                })
+            else:
+                pending_count += 1
+
+        absent_count = len(absent_details)
         
         # FIX: Count how many UNIQUE employees were late at least once today
         late_count = attendances.filter(status='late').values('employee').distinct().count()
@@ -359,9 +485,13 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             "total_active_employees": total_active_employees,
             "present": present_count,
             "absent": absent_count,
+            "pending": pending_count,
             "on_time": on_time_count,
             "late": late_count,
-            "attendance_details": AttendanceSerializer(attendances, many=True).data
+            "total_hours": format_hours_display(total_hours),
+            "total_hours_value": total_hours,
+            "attendance_details": AttendanceSerializer(attendances, many=True).data,
+            "absent_details": absent_details
         })
 
     @action(detail=False, methods=['get'])
@@ -383,7 +513,8 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         return Response({
             "week": f"{start_date} to {end_date}",
             "total_records": total_working_records,
-            "total_hours": total_hours,
+            "total_hours": format_hours_display(total_hours),
+            "total_hours_value": total_hours,
             "late_arrivals": late_arrivals,
             "average_hours_per_day": round(total_hours / 7, 2) if total_working_records > 0 else 0
         })
@@ -414,7 +545,8 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         return Response({
             "month": f"{year}-{month:02d}",
             "total_working_days": unique_working_days,
-            "total_hours_worked": total_hours,
+            "total_hours_worked": format_hours_display(total_hours),
+            "total_hours_worked_value": total_hours,
             "unique_employees": unique_employees,
             "late_arrivals": late_arrivals,
             "average_daily_attendance": round(unique_working_days / unique_employees, 2) if unique_employees > 0 else 0
@@ -441,6 +573,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
         today = timezone.now().date()
         now = timezone.now()
+        current_time = now.time()
 
         # Check if already checked in today
         existing = Attendance.objects.filter(employee=employee, date=today).first()
@@ -454,47 +587,16 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             employee=employee,
             date=today,
             check_in=now,
-            status='on_time' if now.time() <= employee.start_time else 'late'
+            status='late' if employee.start_time and current_time > employee.start_time else 'on_time'
         )
 
         return Response(
             {
                 "message": "Check-in successful",
-                "record": AttendanceSerializer(attendance).data
+                "record": AttendanceSerializer(attendance).data,
             },
             status=status.HTTP_201_CREATED
         )
-
-    @action(detail=False, methods=['post'], permission_classes=[AllowAny])
-    def check_out(self, request):
-        """Check out an employee"""
-        emp_id = request.data.get('emp_id')
-        
-        if not emp_id:
-            return Response(
-                {"error": "emp_id is required"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        try:
-            employee = Employee.objects.get(emp_id=emp_id)
-        except Employee.DoesNotExist:
-            return Response(
-                {"error": f"Employee with id {emp_id} not found"},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
-        today = timezone.now().date()
-        now = timezone.now()
-
-        # Get today's attendance
-        attendance = Attendance.objects.filter(employee=employee, date=today).first()
-        
-        if not attendance:
-            return Response(
-                {"error": "No check-in record found for today"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
 
         if attendance.check_out:
             return Response(
@@ -508,14 +610,12 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         return Response(
             {
                 "message": "Check-out successful",
-                "total_hours": attendance.total_hours,
+                "total_hours": format_hours_display(attendance.total_hours),
+                "total_hours_value": attendance.total_hours,
                 "record": AttendanceSerializer(attendance).data
             },
             status=status.HTTP_200_OK
         )
-
-  
-    from datetime import datetime  # Make sure this is at the very top of views.py
 
     @action(detail=False, methods=['post'], permission_classes=[AllowAny])
     def auto_attendance(self, request):
@@ -583,13 +683,13 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         if not last_attendance or (last_attendance.check_out is not None):
             # ===== NEW CHECK-IN =====
             shift_start = employee.start_time
-            is_late = current_time > shift_start
+            is_late = bool(shift_start and current_time > shift_start)
             
             status_val = 'late' if is_late else 'on_time'
             
             # Late message calculation
             late_msg = "On time"
-            if is_late:
+            if is_late and shift_start:
                 shift_start_dt = datetime.combine(today, shift_start)
                 total_minutes = int((now - shift_start_dt).total_seconds() / 60)
                 
@@ -620,7 +720,8 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 "check_out": "--:--",
                 "is_late": is_late,
                 "late_message": late_msg,
-                "total_hours_today": 0
+                "total_hours_today": "0h 0m",
+                "total_hours_today_value": 0
             })
         elif last_attendance.check_in is not None and last_attendance.check_out is None:
             # ===== CHECK-OUT =====
@@ -646,7 +747,8 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 "check_out": now.strftime('%I:%M %p'),
                 "is_late": False,
                 "late_message": None,
-                "total_hours_today": total_hours
+                "total_hours_today": format_hours_display(total_hours),
+                "total_hours_today_value": total_hours
             })
 
         response_payload = {

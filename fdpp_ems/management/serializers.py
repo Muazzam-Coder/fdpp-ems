@@ -4,6 +4,21 @@ from .models import Employee, Attendance, PaidLeave, Shift, UserAccessLevel
 from django.utils import timezone
 from datetime import datetime
 
+
+def format_hours_display(hours_value):
+    if not hours_value:
+        return "0h 0m"
+
+    total_minutes = int(round(float(hours_value) * 60))
+    hours = total_minutes // 60
+    minutes = total_minutes % 60
+
+    if hours and minutes:
+        return f"{hours}h {minutes}m"
+    if hours:
+        return f"{hours}h"
+    return f"{minutes}m"
+
 class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
@@ -20,19 +35,20 @@ class RegisterSerializer(serializers.Serializer):
     username = serializers.CharField(max_length=150)
     email = serializers.EmailField()
     password = serializers.CharField(write_only=True, min_length=8)
-    first_name = serializers.CharField(max_length=150, required=False)
-    last_name = serializers.CharField(max_length=150, required=False)
+    first_name = serializers.CharField(max_length=150, required=False, allow_null=True, allow_blank=True)
+    last_name = serializers.CharField(max_length=150, required=False, allow_null=True, allow_blank=True)
     
     # Employee fields
-    phone = serializers.CharField(max_length=20, required=False, allow_blank=True)
-    CNIC = serializers.CharField(max_length=20)
-    address = serializers.CharField(required=False, allow_blank=True)
-    relative = serializers.CharField(max_length=255, required=False, allow_blank=True)
-    r_phone = serializers.CharField(max_length=20, required=False, allow_blank=True)
-    r_address = serializers.CharField(required=False, allow_blank=True)
-    start_time = serializers.TimeField(required=False, default='09:00:00')
-    end_time = serializers.TimeField(required=False, default='17:00:00')
-    shift_type = serializers.CharField(max_length=100, required=False, default='morning')
+    designation = serializers.CharField(max_length=255, required=False, allow_null=True, allow_blank=True)
+    phone = serializers.CharField(max_length=20, required=False, allow_null=True, allow_blank=True)
+    CNIC = serializers.CharField(max_length=20, required=False, allow_null=True, allow_blank=True)
+    address = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    relative = serializers.CharField(max_length=255, required=False, allow_null=True, allow_blank=True)
+    r_phone = serializers.CharField(max_length=20, required=False, allow_null=True, allow_blank=True)
+    r_address = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    start_time = serializers.TimeField(required=False, allow_null=True)
+    end_time = serializers.TimeField(required=False, allow_null=True)
+    shift_type = serializers.CharField(max_length=100, required=False, allow_null=True, allow_blank=True)
     
     # Image upload
     profile_img = serializers.ImageField(required=False, allow_null=True)
@@ -48,6 +64,8 @@ class RegisterSerializer(serializers.Serializer):
         return value
     
     def validate_CNIC(self, value):
+        if value in (None, ''):
+            return value
         if Employee.objects.filter(CNIC=value).exists():
             raise serializers.ValidationError("CNIC already exists.")
         return value
@@ -69,16 +87,17 @@ class RegisterSerializer(serializers.Serializer):
         # Create employee profile
         employee = Employee.objects.create(
             user=user,
-            name=validated_data.get('first_name', user.username),
-            phone=validated_data.get('phone', ''),
+            name=validated_data.get('first_name') or user.username,
+            designation=validated_data.get('designation'),
+            phone=validated_data.get('phone'),
             CNIC=validated_data.get('CNIC'),
-            address=validated_data.get('address', ''),
-            relative=validated_data.get('relative', ''),
-            r_phone=validated_data.get('r_phone', ''),
-            r_address=validated_data.get('r_address', ''),
-            start_time=validated_data.get('start_time', '09:00:00'),
-            end_time=validated_data.get('end_time', '17:00:00'),
-            shift_type=validated_data.get('shift_type', 'morning'),
+            address=validated_data.get('address'),
+            relative=validated_data.get('relative'),
+            r_phone=validated_data.get('r_phone'),
+            r_address=validated_data.get('r_address'),
+            start_time=validated_data.get('start_time'),
+            end_time=validated_data.get('end_time'),
+            shift_type=validated_data.get('shift_type') or 'morning',
             profile_img=profile_img
         )
         
@@ -167,28 +186,21 @@ class EmployeeSerializer(serializers.ModelSerializer):
     username = serializers.CharField(source='user.username', read_only=True, allow_null=True)
     email = serializers.CharField(source='user.email', read_only=True, allow_null=True)
     profile_img = serializers.ImageField(required=False, allow_null=True)
+    designation = serializers.CharField(required=False, allow_null=True, allow_blank=True)
     
     class Meta:
         model = Employee
         fields = [
-            'id', 'emp_id', 'username', 'email', 'name', 'profile_img', 
+            'id', 'emp_id', 'username', 'email', 'name', 'designation', 'profile_img', 
             'salary', 'hourly_rate', 'shift_type', 'start_time', 'end_time', 
             'address', 'phone', 'CNIC', 'relative', 'r_phone', 'r_address', 
             'status', 'date_joined', 'last_modified', 'total_hours_today'
         ]
         read_only_fields = ['emp_id', 'username', 'email', 'last_modified']
-    
-    def get_profile_img(self, obj):
-        """Return full URL for profile image"""
-        if obj.profile_img:
-            request = self.context.get('request')
-            if request:
-                return request.build_absolute_uri(obj.profile_img.url)
-            return obj.profile_img.url
-        return None
 
 class AttendanceSerializer(serializers.ModelSerializer):
-    total_hours = serializers.ReadOnlyField()
+    total_hours = serializers.SerializerMethodField()
+    total_hours_value = serializers.SerializerMethodField()
     is_late = serializers.ReadOnlyField()
     employee_name = serializers.CharField(source='employee.name', read_only=True)
     check_in_time = serializers.TimeField(write_only=True, format='%H:%M:%S')
@@ -201,9 +213,15 @@ class AttendanceSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'employee', 'employee_name', 'date', 'check_in', 'check_out',
             'check_in_time', 'check_out_time', 'message_late', 'status', 'total_hours', 'is_late',
-            'created_at', 'updated_at'
+            'total_hours_value', 'created_at', 'updated_at'
         ]
         read_only_fields = ['created_at', 'updated_at', 'check_in', 'check_out']
+
+    def get_total_hours(self, obj):
+        return format_hours_display(obj.total_hours)
+
+    def get_total_hours_value(self, obj):
+        return obj.total_hours
 
     def get_check_in(self, obj):
         """Return only time portion of check_in"""
