@@ -596,7 +596,7 @@ export default function Employees(){
           <table className="min-w-full table-auto">
             <thead>
               <tr>
-                <th className="text-left text-xs font-semibold text-gray-600 uppercase tracking-wider px-4 py-2">Employee ID</th>
+                <th className="text-left text-xs font-semibold text-gray-600 uppercase tracking-wider px-4 py-2">ID</th>
                 <th className="text-left text-xs font-semibold text-gray-600 uppercase tracking-wider px-4 py-2">Name</th>
                 <th className="text-left text-xs font-semibold text-gray-600 uppercase tracking-wider px-4 py-2">Shift</th>
                 <th className="text-left text-xs font-semibold text-gray-600 uppercase tracking-wider px-4 py-2">Timing</th>
@@ -900,7 +900,7 @@ export default function Employees(){
                     placeholder="Search and select relatives..."
                   />
                 </div>
-                <small className="text-xs text-gray-500">Select one or more employees</small>
+                {/* <small className="text-xs text-gray-500">Select one or more employees</small> */}
               </label>
 
               <div className="col-span-1 md:col-span-2 flex justify-end gap-3 mt-2">
