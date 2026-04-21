@@ -376,6 +376,87 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             "present_today": present_today
         })
 
+    @action(detail=False, methods=['get', 'post'], url_path='relatives')
+    def relatives(self, request):
+        """Get or set relatives for an employee.
+
+        GET params:
+        - emp_id (required): employee emp_id to query
+        - transitive (optional): 'true' to return full connected relatives graph
+        - name (optional): filter relatives by name (icontains)
+
+        POST body (json):
+        - emp_id (required): employee emp_id to update
+        - relatives: comma-separated string of emp_id values OR list of ints
+
+        Response: single variable `relatives` containing list of relatives (dicts).
+        """
+        if request.method == 'GET':
+            emp_id = request.query_params.get('emp_id') or request.query_params.get('employee')
+        else:
+            emp_id = request.data.get('emp_id')
+
+        if not emp_id:
+            return Response({"error": "Please provide emp_id"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            employee = Employee.objects.get(emp_id=emp_id)
+        except Employee.DoesNotExist:
+            return Response({"error": f"Employee with id {emp_id} not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if request.method == 'POST':
+            # accept comma-separated string or list
+            raw = request.data.get('relatives', '')
+            rel_ids = []
+            if isinstance(raw, str):
+                raw = raw.strip()
+                if raw:
+                    rel_ids = [int(x.strip()) for x in raw.split(',') if x.strip().isdigit()]
+            elif isinstance(raw, (list, tuple)):
+                rel_ids = [int(x) for x in raw if isinstance(x, (int, str)) and str(x).isdigit()]
+
+            # Save comma-separated into legacy `relative` field
+            employee.relative = ','.join(str(x) for x in rel_ids)
+            employee.save()
+
+            # Update M2M relations symmetrically
+            relatives_qs = Employee.objects.filter(emp_id__in=rel_ids)
+            employee.relatives.set(relatives_qs)
+
+            # Because M2M is symmetrical, related sides are reflected automatically
+
+            # Prepare response
+            data_qs = relatives_qs.order_by('emp_id')
+            data = [{"id": r.id, "emp_id": r.emp_id, "name": r.name} for r in data_qs]
+            return Response({"relatives": data})
+
+        # GET handling
+        transitive = str(request.query_params.get('transitive', '')).lower() in ('1', 'true', 'yes')
+        name_filter = request.query_params.get('name')
+
+        if not transitive:
+            relatives_qs = employee.relatives.all()
+        else:
+            visited = set()
+            queue = [employee]
+            visited.add(employee.pk)
+            collected = set()
+            while queue:
+                current = queue.pop(0)
+                for r in current.relatives.all():
+                    if r.pk not in visited:
+                        visited.add(r.pk)
+                        queue.append(r)
+                    if r.pk != employee.pk:
+                        collected.add(r.pk)
+            relatives_qs = Employee.objects.filter(pk__in=collected)
+
+        if name_filter:
+            relatives_qs = relatives_qs.filter(name__icontains=name_filter)
+
+        data = [{"id": r.id, "emp_id": r.emp_id, "name": r.name} for r in relatives_qs.order_by('emp_id')]
+        return Response({"relatives": data})
+
 class AttendanceViewSet(viewsets.ModelViewSet):
     queryset = Attendance.objects.all().order_by('-date')
     serializer_class = AttendanceSerializer

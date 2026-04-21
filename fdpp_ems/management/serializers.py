@@ -44,6 +44,9 @@ class RegisterSerializer(serializers.Serializer):
     CNIC = serializers.CharField(max_length=20, required=False, allow_null=True, allow_blank=True)
     address = serializers.CharField(required=False, allow_null=True, allow_blank=True)
     relative = serializers.CharField(max_length=255, required=False, allow_null=True, allow_blank=True)
+    referance = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    # Accept list of existing Employee PKs to link as relatives
+    relatives = serializers.ListField(child=serializers.IntegerField(), required=False)
     r_phone = serializers.CharField(max_length=20, required=False, allow_null=True, allow_blank=True)
     r_address = serializers.CharField(required=False, allow_null=True, allow_blank=True)
     start_time = serializers.TimeField(required=False, allow_null=True)
@@ -93,6 +96,7 @@ class RegisterSerializer(serializers.Serializer):
             CNIC=validated_data.get('CNIC'),
             address=validated_data.get('address'),
             relative=validated_data.get('relative'),
+            referance=validated_data.get('referance'),
             r_phone=validated_data.get('r_phone'),
             r_address=validated_data.get('r_address'),
             start_time=validated_data.get('start_time'),
@@ -100,6 +104,12 @@ class RegisterSerializer(serializers.Serializer):
             shift_type=validated_data.get('shift_type') or 'morning',
             profile_img=profile_img
         )
+        # Link relatives (if provided) by their PKs
+        relatives_pks = validated_data.get('relatives') or []
+        if relatives_pks:
+            relatives_qs = Employee.objects.filter(pk__in=relatives_pks)
+            for rel in relatives_qs:
+                employee.relatives.add(rel)
         
         return {'user': user, 'employee': employee}
 
@@ -187,6 +197,10 @@ class EmployeeSerializer(serializers.ModelSerializer):
     email = serializers.CharField(source='user.email', read_only=True, allow_null=True)
     profile_img = serializers.ImageField(required=False, allow_null=True)
     designation = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    # Raw reference input saved as provided
+    referance = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    # Accept list of PKs to link relatives; writeable
+    relatives = serializers.PrimaryKeyRelatedField(many=True, queryset=Employee.objects.all(), required=False)
     
     class Meta:
         model = Employee
@@ -194,9 +208,28 @@ class EmployeeSerializer(serializers.ModelSerializer):
             'id', 'emp_id', 'username', 'email', 'name', 'designation', 'profile_img', 
             'salary', 'hourly_rate', 'shift_type', 'start_time', 'end_time', 
             'address', 'phone', 'CNIC', 'relative', 'r_phone', 'r_address', 
-            'status', 'date_joined', 'last_modified', 'total_hours_today'
+            'status', 'date_joined', 'last_modified', 'total_hours_today', 'referance', 'relatives'
         ]
         read_only_fields = ['emp_id', 'username', 'email', 'last_modified']
+
+    # relatives_info removed; responses should use the `relatives` variable from the relatives endpoint
+
+    def create(self, validated_data):
+        relatives = validated_data.pop('relatives', [])
+        employee = super().create(validated_data)
+        # Add relatives (ManyToMany symmetrical ensures both sides are linked)
+        if relatives:
+            for rel in relatives:
+                employee.relatives.add(rel)
+        return employee
+
+    def update(self, instance, validated_data):
+        relatives = validated_data.pop('relatives', None)
+        instance = super().update(instance, validated_data)
+        if relatives is not None:
+            # Replace relatives list
+            instance.relatives.set(relatives)
+        return instance
 
 class AttendanceSerializer(serializers.ModelSerializer):
     total_hours = serializers.SerializerMethodField()

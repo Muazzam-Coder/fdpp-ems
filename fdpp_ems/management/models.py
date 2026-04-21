@@ -64,7 +64,12 @@ class Employee(models.Model):
     address = models.TextField(null=True, blank=True)
     phone = models.CharField(max_length=20, null=True, blank=True)
     CNIC = models.CharField(max_length=20, unique=True, null=True, blank=True)
+    # legacy free-text relative field (kept for backward compatibility)
     relative = models.CharField(max_length=255, null=True, blank=True)
+    # store raw reference/input as provided on employee endpoint
+    referance = models.TextField(null=True, blank=True)
+    # self-referential many-to-many to represent relatives between employees
+    relatives = models.ManyToManyField('self', symmetrical=True, blank=True, related_name='related_to')
     r_phone = models.CharField(max_length=20, null=True, blank=True)
     r_address = models.TextField(null=True, blank=True)
     
