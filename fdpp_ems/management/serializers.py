@@ -45,8 +45,8 @@ class RegisterSerializer(serializers.Serializer):
     address = serializers.CharField(required=False, allow_null=True, allow_blank=True)
     relative = serializers.CharField(max_length=255, required=False, allow_null=True, allow_blank=True)
     referance = serializers.CharField(required=False, allow_null=True, allow_blank=True)
-    # Accept list of existing Employee PKs to link as relatives
-    relatives = serializers.ListField(child=serializers.IntegerField(), required=False)
+    # Accept list of existing Employee `emp_id` values to link as relatives
+    relatives = serializers.ListField(child=serializers.CharField(), required=False)
     r_phone = serializers.CharField(max_length=20, required=False, allow_null=True, allow_blank=True)
     r_address = serializers.CharField(required=False, allow_null=True, allow_blank=True)
     start_time = serializers.TimeField(required=False, allow_null=True)
@@ -104,12 +104,36 @@ class RegisterSerializer(serializers.Serializer):
             shift_type=validated_data.get('shift_type') or 'morning',
             profile_img=profile_img
         )
-        # Link relatives (if provided) by their PKs
-        relatives_pks = validated_data.get('relatives') or []
-        if relatives_pks:
-            relatives_qs = Employee.objects.filter(pk__in=relatives_pks)
-            for rel in relatives_qs:
-                employee.relatives.add(rel)
+        # Link relatives (if provided) by their `emp_id` values or PKs
+        relatives_inputs = validated_data.get('relatives') or []
+        if relatives_inputs:
+            # `relatives_inputs` may be list of Employee objects (if deserialized by field),
+            # or a list of strings/ints when coming from RegisterSerializer path.
+            if all(hasattr(x, 'pk') for x in relatives_inputs):
+                for rel in relatives_inputs:
+                    employee.relatives.add(rel)
+            else:
+                emp_ids = []
+                for v in relatives_inputs:
+                    vstr = str(v).strip()
+                    # try emp_id lookup first
+                    try:
+                        e = Employee.objects.get(emp_id=vstr)
+                        emp_ids.append(e.emp_id)
+                        continue
+                    except Employee.DoesNotExist:
+                        pass
+                    # try pk lookup
+                    if vstr.isdigit():
+                        try:
+                            e = Employee.objects.get(pk=int(vstr))
+                            emp_ids.append(e.emp_id)
+                        except Employee.DoesNotExist:
+                            pass
+                if emp_ids:
+                    relatives_qs = Employee.objects.filter(emp_id__in=emp_ids)
+                    for rel in relatives_qs:
+                        employee.relatives.add(rel)
         
         return {'user': user, 'employee': employee}
 
@@ -199,8 +223,37 @@ class EmployeeSerializer(serializers.ModelSerializer):
     designation = serializers.CharField(required=False, allow_null=True, allow_blank=True)
     # Raw reference input saved as provided
     referance = serializers.CharField(required=False, allow_null=True, allow_blank=True)
-    # Accept list of PKs to link relatives; writeable
-    relatives = serializers.PrimaryKeyRelatedField(many=True, queryset=Employee.objects.all(), required=False)
+    # Accept list of employee `emp_id` values OR DB PKs to link relatives; writeable
+    # Use a small custom field that accepts either `emp_id` (string) or numeric PK
+    class EmpIdOrPkField(serializers.SlugRelatedField):
+        def to_internal_value(self, value):
+            qs = self.get_queryset()
+            # Normalize
+            if value is None:
+                return None
+            if isinstance(value, int):
+                # try pk lookup first
+                try:
+                    return qs.get(pk=value)
+                except Exception:
+                    raise serializers.ValidationError(f"Employee with pk '{value}' does not exist")
+
+            v = str(value).strip()
+            if v == '':
+                return None
+            # Try emp_id lookup first
+            try:
+                return qs.get(emp_id=v)
+            except Exception:
+                # If value looks numeric, try pk as fallback
+                if v.isdigit():
+                    try:
+                        return qs.get(pk=int(v))
+                    except Exception:
+                        pass
+                raise serializers.ValidationError(f"Employee with emp_id or pk '{value}' does not exist")
+
+    relatives = EmpIdOrPkField(many=True, slug_field='emp_id', queryset=Employee.objects.all(), required=False)
     
     class Meta:
         model = Employee
@@ -219,6 +272,8 @@ class EmployeeSerializer(serializers.ModelSerializer):
         employee = super().create(validated_data)
         # Add relatives (ManyToMany symmetrical ensures both sides are linked)
         if relatives:
+            # Filter out None values (allowed by EmpIdOrPkField when blank inputs provided)
+            relatives = [r for r in relatives if r is not None]
             for rel in relatives:
                 employee.relatives.add(rel)
         return employee
@@ -227,7 +282,9 @@ class EmployeeSerializer(serializers.ModelSerializer):
         relatives = validated_data.pop('relatives', None)
         instance = super().update(instance, validated_data)
         if relatives is not None:
-            # Replace relatives list
+            # Replace relatives list (accepts Emp objects from custom field)
+            # Filter out None values that may come from blank selections
+            relatives = [r for r in relatives if r is not None]
             instance.relatives.set(relatives)
         return instance
 

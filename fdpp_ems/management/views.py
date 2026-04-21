@@ -405,29 +405,47 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             return Response({"error": f"Employee with id {emp_id} not found"}, status=status.HTTP_404_NOT_FOUND)
 
         if request.method == 'POST':
-            # accept comma-separated string or list
+            # accept comma-separated string or list of emp_id values or numeric PKs
             raw = request.data.get('relatives', '')
-            rel_ids = []
+            rel_inputs = []
             if isinstance(raw, str):
                 raw = raw.strip()
                 if raw:
-                    rel_ids = [int(x.strip()) for x in raw.split(',') if x.strip().isdigit()]
+                    rel_inputs = [x.strip() for x in raw.split(',') if x.strip()]
             elif isinstance(raw, (list, tuple)):
-                rel_ids = [int(x) for x in raw if isinstance(x, (int, str)) and str(x).isdigit()]
+                rel_inputs = [x for x in raw if x is not None]
 
-            # Save comma-separated into legacy `relative` field
-            employee.relative = ','.join(str(x) for x in rel_ids)
+            # Normalize inputs to emp_id values where possible
+            resolved_emp_ids = []
+            for v in rel_inputs:
+                vs = str(v).strip()
+                # try emp_id lookup first
+                try:
+                    obj = Employee.objects.get(emp_id=vs)
+                    resolved_emp_ids.append(obj.emp_id)
+                    continue
+                except Employee.DoesNotExist:
+                    pass
+                # try pk lookup
+                if vs.isdigit():
+                    try:
+                        obj = Employee.objects.get(pk=int(vs))
+                        resolved_emp_ids.append(obj.emp_id)
+                        continue
+                    except Employee.DoesNotExist:
+                        pass
+
+            # Save comma-separated into legacy `relative` field (store emp_id values)
+            employee.relative = ','.join(resolved_emp_ids)
             employee.save()
 
-            # Update M2M relations symmetrically
-            relatives_qs = Employee.objects.filter(emp_id__in=rel_ids)
+            # Update M2M relations using emp_id values
+            relatives_qs = Employee.objects.filter(emp_id__in=resolved_emp_ids)
             employee.relatives.set(relatives_qs)
 
-            # Because M2M is symmetrical, related sides are reflected automatically
-
-            # Prepare response
+            # Prepare response (use emp_id as the identifier)
             data_qs = relatives_qs.order_by('emp_id')
-            data = [{"id": r.id, "emp_id": r.emp_id, "name": r.name} for r in data_qs]
+            data = [{"emp_id": r.emp_id, "name": r.name} for r in data_qs]
             return Response({"relatives": data})
 
         # GET handling
@@ -454,7 +472,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         if name_filter:
             relatives_qs = relatives_qs.filter(name__icontains=name_filter)
 
-        data = [{"id": r.id, "emp_id": r.emp_id, "name": r.name} for r in relatives_qs.order_by('emp_id')]
+        data = [{"emp_id": r.emp_id, "name": r.name} for r in relatives_qs.order_by('emp_id')]
         return Response({"relatives": data})
 
 class AttendanceViewSet(viewsets.ModelViewSet):
