@@ -682,11 +682,33 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        # Determine lateness considering overnight shifts (start_time may be before midnight)
+        status_val = 'on_time'
+        late_msg = None
+        if employee.start_time:
+            shift_start_dt = datetime.combine(today, employee.start_time)
+            # If shift crosses midnight (end_time <= start_time) and shift_start is after now,
+            # assume the shift started the previous day.
+            if getattr(employee, 'end_time', None) and employee.end_time <= employee.start_time and shift_start_dt > now:
+                shift_start_dt -= timedelta(days=1)
+
+            is_late = now > shift_start_dt
+            status_val = 'late' if is_late else 'on_time'
+            if is_late:
+                minutes_late = int((now - shift_start_dt).total_seconds() / 60)
+                if minutes_late >= 60:
+                    hours = minutes_late // 60
+                    minutes = minutes_late % 60
+                    late_msg = f"{hours}h {minutes}m late" if minutes else f"{hours}h late"
+                else:
+                    late_msg = f"{minutes_late}m late"
+
         attendance = Attendance.objects.create(
             employee=employee,
             date=today,
             check_in=now,
-            status='late' if employee.start_time and current_time > employee.start_time else 'on_time'
+            status=status_val,
+            message_late=late_msg
         )
 
         return Response(
@@ -782,27 +804,31 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         if not last_attendance or (last_attendance.check_out is not None):
             # ===== NEW CHECK-IN =====
             shift_start = employee.start_time
-            is_late = bool(shift_start and current_time > shift_start)
+            is_late = False
+            late_msg = "On time"
+            if shift_start:
+                shift_start_dt = datetime.combine(today, shift_start)
+                # Adjust for overnight shifts: if shift_end <= shift_start and shift_start is after now,
+                # the actual shift start was yesterday.
+                if getattr(employee, 'end_time', None) and employee.end_time <= shift_start and shift_start_dt > now:
+                    shift_start_dt -= timedelta(days=1)
+
+                is_late = now > shift_start_dt
+                if is_late:
+                    total_minutes = int((now - shift_start_dt).total_seconds() / 60)
+                    # Logic to format as "1h 15m" or just "15m"
+                    if total_minutes >= 60:
+                        hours = total_minutes // 60
+                        minutes = total_minutes % 60
+                        if minutes > 0:
+                            late_msg = f"{hours}h {minutes}m late"
+                        else:
+                            late_msg = f"{hours}h late"
+                    else:
+                        late_msg = f"{total_minutes}m late"
             
             status_val = 'late' if is_late else 'on_time'
-            
-            # Late message calculation
-            late_msg = "On time"
-            if is_late and shift_start:
-                shift_start_dt = datetime.combine(today, shift_start)
-                total_minutes = int((now - shift_start_dt).total_seconds() / 60)
-                
-                # Logic to format as "1h 15m" or just "15m"
-                if total_minutes >= 60:
-                    hours = total_minutes // 60
-                    minutes = total_minutes % 60
-                    if minutes > 0:
-                        late_msg = f"{hours}h {minutes}m late"
-                    else:
-                        late_msg = f"{hours}h late"
-                else:
-                    late_msg = f"{total_minutes}m late"
-            
+
             attendance = Attendance.objects.create(
                 employee=employee,
                 date=today,

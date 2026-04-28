@@ -176,13 +176,25 @@ class Attendance(models.Model):
 
     @property
     def is_late(self):
-        """Check if employee was late"""
-        if self.check_in:
-            # REMOVED: timezone.make_aware
-            # UPDATED: Use simple datetime.combine for naive comparison
-            shift_start = datetime.combine(self.date, self.employee.start_time)
-            return self.check_in > shift_start
-        return False
+        """Check if employee was late.
+
+        Handles overnight shifts (start_time > end_time) by adjusting the
+        shift start datetime to the previous day when necessary. This ensures
+        a check-in at, e.g., 00:01 is considered late for a 23:00 shift.
+        """
+        if not self.check_in or not self.employee.start_time:
+            return False
+
+        shift_start = datetime.combine(self.date, self.employee.start_time)
+
+        # If the employee's shift crosses midnight (end_time <= start_time)
+        # and the computed shift_start is after the actual check_in, assume
+        # the shift_start was on the previous day.
+        end_time = getattr(self.employee, 'end_time', None)
+        if end_time and end_time <= self.employee.start_time and shift_start > self.check_in:
+            shift_start = shift_start - timedelta(days=1)
+
+        return self.check_in > shift_start
 class PaidLeave(models.Model):
     LEAVE_TYPE_CHOICES = [
         ('sick', 'Sick Leave'),
