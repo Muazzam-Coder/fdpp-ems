@@ -114,31 +114,44 @@ class BiometricMonitorWebSocket:
             return False
 
     async def connect_websocket(self):
-        """Establish WebSocket connection to server"""
+        """Establish WebSocket connection to server with keepalive/ping settings"""
         try:
-            self.ws_conn = await websockets.connect(self.ws_url)
+            # use ping/pong keepalive to prevent silent NAT/firewall drops
+            self.ws_conn = await websockets.connect(
+                self.ws_url,
+                ping_interval=20,
+                ping_timeout=10,
+            )
             logger.info(f"WebSocket connected to {self.ws_url}")
-            
-            # Receive connection confirmation
-            response = await self.ws_conn.recv()
-            logger.info(f"Server says: {response}")
+
+            # Receive connection confirmation (short timeout)
+            try:
+                response = await asyncio.wait_for(self.ws_conn.recv(), timeout=5)
+                logger.info(f"Server says: {response}")
+            except asyncio.TimeoutError:
+                logger.info("No immediate welcome message received (ok)")
+
             return True
         except Exception as e:
             logger.error(f"WebSocket connection failed: {str(e)}")
+            self.ws_conn = None
             return False
 
     async def send_biometric_data(self, emp_id):
         """Send employee ID to server via WebSocket and await response"""
         try:
-            if not self.ws_conn:
-                logger.error("WebSocket not connected")
-                return False
+            # If socket isn't open, try reconnecting once
+            if not self.ws_conn or not getattr(self.ws_conn, 'open', False):
+                logger.warning("WebSocket not open — attempting reconnect...")
+                if not await self.connect_websocket():
+                    logger.error("WebSocket reconnect failed")
+                    return False
 
             payload = {"emp_id": emp_id}
             await self.ws_conn.send(json.dumps(payload))
-            
+
             # Wait for the server to process attendance and return info
-            response = await self.ws_conn.recv()
+            response = await asyncio.wait_for(self.ws_conn.recv(), timeout=10)
             data = json.loads(response)
             
             # If the response is a broadcast from group_send
@@ -151,6 +164,13 @@ class BiometricMonitorWebSocket:
             return False
         except Exception as e:
             logger.error(f"Error sending data: {str(e)}")
+            # If the connection is broken, try to close and clear reference so main loop reconnects
+            try:
+                if self.ws_conn:
+                    await self.ws_conn.close()
+            except Exception:
+                pass
+            self.ws_conn = None
             return False
 
     async def process_attendance(self):

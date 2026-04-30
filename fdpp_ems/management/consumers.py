@@ -5,6 +5,7 @@
 import json
 from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.db import database_sync_to_async
+from django.db import close_old_connections
 from .models import Employee, Attendance
 from datetime import datetime
 from django.conf import settings
@@ -57,6 +58,8 @@ class BiometricConsumer(AsyncWebsocketConsumer):
     def process_biometric_scan(self, emp_id):
         """Synchronized Logic: Matches auto_attendance view exactly"""
         try:
+            # Ensure any stale DB connections are closed before using ORM
+            close_old_connections()
             employee = Employee.objects.get(emp_id=emp_id)
             # FIXED: Use system clock (Naive) to match settings.USE_TZ = False
             now = datetime.now()
