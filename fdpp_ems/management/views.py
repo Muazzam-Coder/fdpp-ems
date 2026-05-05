@@ -11,11 +11,18 @@ from .serializers import (
     CreateAdminManagerSerializer, RegisterSerializer
 )
 from django.db.models import Sum, Count, Q, Avg
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time
 from django.utils import timezone
 from fdpp_ems import settings
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
+from io import BytesIO
+from django.http import HttpResponse
+try:
+    import openpyxl
+    from openpyxl.utils import get_column_letter
+except Exception:
+    openpyxl = None
 
 # Permission check: Only admins can create admin/manager
 def is_admin(user):
@@ -51,11 +58,44 @@ def build_absent_entries(report_date, request=None):
         if employee.emp_id in present_employee_ids:
             continue
 
+        # If employee has no defined shift times, decide pending vs absent based on date
         if not employee.start_time or not employee.end_time:
-            pending_count += 1
+            if report_date < today:
+                on_leave = PaidLeave.objects.filter(
+                    employee=employee,
+                    approved=True,
+                    start_time__date__lte=report_date,
+                    end_time__date__gte=report_date,
+                ).exists()
+                status_val = "on_leave" if on_leave else "absent"
+                absent_entries.append({
+                    "id": None,
+                    "employee": employee.emp_id,
+                    "employee_name": employee.name,
+                    "date": report_date,
+                    "check_in": None,
+                    "check_out": None,
+                    "message_late": None,
+                    "status": status_val,
+                    "total_hours": "0h 0m",
+                    "is_late": False,
+                    "created_at": None,
+                    "updated_at": None,
+                })
+            else:
+                pending_count += 1
             continue
 
         if report_date < today or (report_date == today and current_time >= employee.end_time):
+            # Check if employee has an approved paid leave covering this date
+            on_leave = PaidLeave.objects.filter(
+                employee=employee,
+                approved=True,
+                start_time__date__lte=report_date,
+                end_time__date__gte=report_date,
+            ).exists()
+
+            status_val = "on_leave" if on_leave else "absent"
             absent_entries.append({
                 "id": None,
                 "employee": employee.emp_id,
@@ -64,7 +104,7 @@ def build_absent_entries(report_date, request=None):
                 "check_in": None,
                 "check_out": None,
                 "message_late": None,
-                "status": "absent",
+                "status": status_val,
                 "total_hours": "0h 0m",
                 "is_late": False,
                 "created_at": None,
@@ -111,12 +151,11 @@ class AuthViewSet(viewsets.ViewSet):
                     "shift_type": employee.shift_type,
                     "start_time": employee.start_time.strftime('%H:%M:%S') if employee.start_time else None,
                     "end_time": employee.end_time.strftime('%H:%M:%S') if employee.end_time else None,
-                    # "profile_img": employee.profile_img.url if employee.profile_img else None
                     "profile_img": f"http://{settings.SERVER_IP}:{settings.SERVER_PORT}{employee.profile_img.url}" if employee.profile_img else None
                 }
             }, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-    
+
     @action(detail=False, methods=['post'], permission_classes=[IsAdmin])
     def create_admin_manager(self, request):
         """Create a new admin or manager user with optional profile image (admin only)"""
@@ -483,49 +522,390 @@ class AttendanceViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def list(self, request, *args, **kwargs):
-        """Return today's attendance by default, plus synthetic absent rows after shift end."""
-        date_str = request.query_params.get('date')
-        today = timezone.now().date()
+        """Return attendance list with filters (date, date_from/date_to, employee, status).
 
-        if not date_str:
-            report_date = today
-        else:
+        - If `date` is provided (single day) we include synthetic absent rows after shift end.
+        - Otherwise use DRF filters (`AttendanceFilter`) and support pagination.
+        """
+        date_str = request.query_params.get('date')
+
+        # Start with DRF-filtered queryset so filters like employee, date_from/date_to, status apply
+        qs = self.filter_queryset(self.get_queryset())
+
+        # Single-date behavior: include absent entries and day-level summary
+        if date_str:
             try:
                 report_date = datetime.strptime(date_str, '%Y-%m-%d').date()
             except ValueError:
                 return Response({"error": "Invalid date format"}, status=status.HTTP_400_BAD_REQUEST)
 
-        attendances = Attendance.objects.filter(date=report_date).order_by('employee', 'check_in')
-        serializer = AttendanceSerializer(attendances, many=True, context={'request': request})
-        absent_entries, pending_count = build_absent_entries(report_date, request=request)
+            attendances = qs.filter(date=report_date).order_by('employee', 'check_in')
+            serializer = AttendanceSerializer(attendances, many=True, context={'request': request})
+            absent_entries, pending_count = build_absent_entries(report_date, request=request)
 
-        results = list(serializer.data) + absent_entries
-        present_count = attendances.values('employee').distinct().count()
-        absent_count = len(absent_entries)
-        late_count = attendances.filter(status='late').values('employee').distinct().count()
-        on_time_count = max(0, present_count - late_count)
-        total_hours = round(sum(att.total_hours for att in attendances), 2)
+            results = list(serializer.data) + absent_entries
+            present_count = attendances.values('employee').distinct().count()
+            absent_count = len(absent_entries)
+            late_count = attendances.filter(status='late').values('employee').distinct().count()
+            on_time_count = max(0, present_count - late_count)
+            total_hours = round(sum(att.total_hours for att in attendances), 2)
 
+            return Response({
+                "date": report_date,
+                "present": present_count,
+                "absent": absent_count,
+                "pending": pending_count,
+                "on_time": on_time_count,
+                "late": late_count,
+                "total_hours": format_hours_display(total_hours),
+                "total_hours_value": total_hours,
+                "count": len(results),
+                "results": results,
+            })
+
+        # Multi-day / filtered list: use filtered queryset and support pagination
+        queryset = qs.order_by('-date', 'employee', 'check_in')
+
+        # Compute aggregates on full queryset (not just page)
+        total_hours = round(sum(att.total_hours for att in queryset), 2)
+        present_count = queryset.values('employee').distinct().count()
+        total_count = queryset.count()
+
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = AttendanceSerializer(page, many=True, context={'request': request})
+            paginated = self.get_paginated_response(serializer.data).data
+            # augment paginated response with summary fields
+            paginated.update({
+                "present": present_count,
+                "total_hours": format_hours_display(total_hours),
+                "total_hours_value": total_hours,
+                "total_count": total_count,
+            })
+            return Response(paginated)
+
+        serializer = AttendanceSerializer(queryset, many=True, context={'request': request})
         return Response({
-            "date": report_date,
             "present": present_count,
-            "absent": absent_count,
-            "pending": pending_count,
-            "on_time": on_time_count,
-            "late": late_count,
             "total_hours": format_hours_display(total_hours),
             "total_hours_value": total_hours,
-            "count": len(results),
-            "results": results,
+            "count": total_count,
+            "results": serializer.data,
         })
 
+    @action(detail=False, methods=['get'])
+    def export_excel(self, request):
+        """Export attendance matrix to Excel: rows=dates, columns=employees.
+
+        Query params:
+        - date_from (YYYY-MM-DD) required
+        - date_to (YYYY-MM-DD) required
+        - employees: optional comma-separated emp_id list; defaults to active employees
+        - employee: optional single emp_id to export for a specific employee
+        """
+        if openpyxl is None:
+            return Response({"error": "openpyxl is required to export Excel. Please pip install openpyxl."}, status=500)
+
+        start = request.query_params.get('date_from')
+        end = request.query_params.get('date_to')
+        if not start or not end:
+            return Response({"error": "Please provide date_from and date_to in YYYY-MM-DD"}, status=400)
+        try:
+            start_date = datetime.strptime(start, '%Y-%m-%d').date()
+            end_date = datetime.strptime(end, '%Y-%m-%d').date()
+        except ValueError:
+            return Response({"error": "Invalid date format. Use YYYY-MM-DD"}, status=400)
+
+        # Accept either `employee` (single emp_id) or `employees` (comma-separated)
+        emp_single = request.query_params.get('employee')
+        emp_param = request.query_params.get('employees')
+        if emp_single and str(emp_single).strip().isdigit():
+            employees = list(Employee.objects.filter(emp_id=int(emp_single)).order_by('emp_id'))
+        elif emp_param:
+            emp_ids = [int(x.strip()) for x in emp_param.split(',') if x.strip().isdigit()]
+            employees = list(Employee.objects.filter(emp_id__in=emp_ids).order_by('emp_id'))
+        else:
+            employees = list(Employee.objects.filter(status='active').order_by('emp_id'))
+
+        # Build workbook
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = 'Attendance'
+
+        # Header row: Date + for each employee a single column with "CheckIn - CheckOut"
+        headers = ['Date']
+        for e in employees:
+            label = e.name or str(e.emp_id)
+            headers.append(f"{label} (In - Out)")
+
+        for col_idx, head in enumerate(headers, start=1):
+            ws.cell(row=1, column=col_idx, value=head)
+
+        # Fill rows per date
+        row = 2
+        delta = (end_date - start_date).days
+        # Use current time to decide whether a day should be considered absent or still pending
+        current_time = datetime.now().time()
+        today = timezone.now().date()
+
+        for d_offset in range(delta + 1):
+            rdate = start_date + timedelta(days=d_offset)
+            ws.cell(row=row, column=1, value=rdate.strftime('%Y-%m-%d'))
+
+            # for each employee write a single cell with "CheckIn - CheckOut"
+            for idx, emp in enumerate(employees):
+                col = 2 + idx
+                # Find attendances for this employee on the row date, either by stored
+                # `date` or by the `check_in` datetime falling on that date.
+                atts = Attendance.objects.filter(employee=emp).filter(
+                    Q(date=rdate) | Q(check_in__date=rdate)
+                )
+
+                # Prefer attendances whose actual `check_in` falls on this date to avoid
+                # picking an unrelated open record from another day.
+                day_atts = atts.filter(check_in__date=rdate).order_by('check_in')
+                if day_atts.exists():
+                    atts = day_atts
+                else:
+                    atts = atts.order_by('check_in')
+
+                check_in_val = "--:--"
+                check_out_val = "--:--"
+                if atts.exists():
+                    first = atts.first()
+                    last = atts.last()
+                    if first.check_in:
+                        try:
+                            check_in_val = first.check_in.strftime('%I:%M %p')
+                        except Exception:
+                            check_in_val = str(first.check_in)
+                    if last.check_out:
+                        try:
+                            check_out_val = last.check_out.strftime('%I:%M %p')
+                        except Exception:
+                            check_out_val = str(last.check_out)
+
+                if atts.exists():
+                    combined = f"{check_in_val} - {check_out_val}"
+                else:
+                    # If no attendance, check for approved paid leave covering the date
+                    leave = PaidLeave.objects.filter(
+                        employee=emp,
+                        approved=True,
+                        start_time__date__lte=rdate,
+                        end_time__date__gte=rdate,
+                    ).first()
+                    if leave:
+                        combined = "Leave"
+                    else:
+                        # If employee has no defined shift times, treat past dates as Absent
+                        if not emp.start_time or not emp.end_time:
+                            if rdate < today:
+                                combined = "Absent"
+                            else:
+                                combined = f"{check_in_val} - {check_out_val}"
+                        else:
+                            # If the date is past (or today past shift end) mark Absent
+                            if rdate < today or (rdate == today and current_time >= emp.end_time):
+                                combined = "Absent"
+                            else:
+                                # Future or pending day: keep placeholder
+                                combined = f"{check_in_val} - {check_out_val}"
+
+                ws.cell(row=row, column=col, value=combined)
+
+            row += 1
+
+        # Auto-fit column widths (simple heuristic)
+        for i, column_cells in enumerate(ws.columns, start=1):
+            max_length = 0
+            for cell in column_cells:
+                try:
+                    val = str(cell.value) if cell.value is not None else ''
+                except Exception:
+                    val = ''
+                if len(val) > max_length:
+                    max_length = len(val)
+            ws.column_dimensions[get_column_letter(i)].width = min(max_length + 2, 50)
+
+        # Save to bytes
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+
+        filename = f"attendance_{start}_{end}.xlsx"
+        resp = HttpResponse(output.getvalue(), content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        resp['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return resp
+
+    @action(detail=False, methods=['get'])
+    def export_payout(self, request):
+        """Export attendance matrix with payout row: last row contains salary = total_hours * hourly_rate
+
+        Query params:
+        - date_from (YYYY-MM-DD) required
+        - date_to (YYYY-MM-DD) required
+        - employees: optional comma-separated emp_id list; defaults to active employees
+        - employee: optional single emp_id to export for a specific employee
+        """
+        if openpyxl is None:
+            return Response({"error": "openpyxl is required to export Excel. Please pip install openpyxl."}, status=500)
+
+        start = request.query_params.get('date_from')
+        end = request.query_params.get('date_to')
+        if not start or not end:
+            return Response({"error": "Please provide date_from and date_to in YYYY-MM-DD"}, status=400)
+        try:
+            start_date = datetime.strptime(start, '%Y-%m-%d').date()
+            end_date = datetime.strptime(end, '%Y-%m-%d').date()
+        except ValueError:
+            return Response({"error": "Invalid date format. Use YYYY-MM-DD"}, status=400)
+
+        # Accept either `employee` (single emp_id) or `employees` (comma-separated)
+        emp_single = request.query_params.get('employee')
+        emp_param = request.query_params.get('employees')
+        if emp_single and str(emp_single).strip().isdigit():
+            employees = list(Employee.objects.filter(emp_id=int(emp_single)).order_by('emp_id'))
+        elif emp_param:
+            emp_ids = [int(x.strip()) for x in emp_param.split(',') if x.strip().isdigit()]
+            employees = list(Employee.objects.filter(emp_id__in=emp_ids).order_by('emp_id'))
+        else:
+            employees = list(Employee.objects.filter(status='active').order_by('emp_id'))
+
+        # Build workbook
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = 'Payout'
+
+        # Header row: Date + for each employee a single column with "CheckIn - CheckOut"
+        headers = ['Date']
+        for e in employees:
+            label = e.name or str(e.emp_id)
+            headers.append(f"{label} (In - Out)")
+
+        for col_idx, head in enumerate(headers, start=1):
+            ws.cell(row=1, column=col_idx, value=head)
+
+        # Fill rows per date (reuse logic from export_excel)
+        row = 2
+        delta = (end_date - start_date).days
+        current_time = datetime.now().time()
+        today = timezone.now().date()
+
+        # track totals per employee
+        totals = {emp.emp_id: 0.0 for emp in employees}
+
+        for d_offset in range(delta + 1):
+            rdate = start_date + timedelta(days=d_offset)
+            ws.cell(row=row, column=1, value=rdate.strftime('%Y-%m-%d'))
+
+            for idx, emp in enumerate(employees):
+                col = 2 + idx
+                atts = Attendance.objects.filter(employee=emp).filter(
+                    Q(date=rdate) | Q(check_in__date=rdate)
+                )
+                day_atts = atts.filter(check_in__date=rdate).order_by('check_in')
+                if day_atts.exists():
+                    atts = day_atts
+                else:
+                    atts = atts.order_by('check_in')
+
+                check_in_val = "--:--"
+                check_out_val = "--:--"
+                if atts.exists():
+                    first = atts.first()
+                    last = atts.last()
+                    if first.check_in:
+                        try:
+                            check_in_val = first.check_in.strftime('%I:%M %p')
+                        except Exception:
+                            check_in_val = str(first.check_in)
+                    if last.check_out:
+                        try:
+                            check_out_val = last.check_out.strftime('%I:%M %p')
+                        except Exception:
+                            check_out_val = str(last.check_out)
+                    # accumulate total hours for this day
+                    totals[emp.emp_id] += sum(att.total_hours for att in atts)
+
+                else:
+                    # Leave handling
+                    leave = PaidLeave.objects.filter(
+                        employee=emp,
+                        approved=True,
+                        start_time__date__lte=rdate,
+                        end_time__date__gte=rdate,
+                    ).first()
+                    if leave:
+                        check_in_val = "Leave"
+                        check_out_val = ""
+                    else:
+                        if not emp.start_time or not emp.end_time:
+                            if rdate < today:
+                                check_in_val = "Absent"
+                                check_out_val = ""
+                            else:
+                                check_in_val = "--:--"
+                                check_out_val = "--:--"
+                        else:
+                            if rdate < today or (rdate == today and current_time >= emp.end_time):
+                                check_in_val = "Absent"
+                                check_out_val = ""
+                            else:
+                                check_in_val = "--:--"
+                                check_out_val = "--:--"
+
+                ws.cell(row=row, column=col, value=f"{check_in_val} - {check_out_val}" if check_out_val else check_in_val)
+
+            row += 1
+
+        # Append totals row and salary row
+        # blank separator
+        row += 1
+        totals_row = row
+        ws.cell(row=totals_row, column=1, value='Total Hours')
+        for idx, emp in enumerate(employees):
+            col = 2 + idx
+            hrs = round(totals.get(emp.emp_id, 0.0), 2)
+            ws.cell(row=totals_row, column=col, value=hrs)
+
+        # salary row
+        row += 1
+        salary_row = row
+        ws.cell(row=salary_row, column=1, value='Salary')
+        for idx, emp in enumerate(employees):
+            col = 2 + idx
+            hourly = float(emp.hourly_rate or 0)
+            pay = round(totals.get(emp.emp_id, 0.0) * hourly, 2)
+            ws.cell(row=salary_row, column=col, value=pay)
+
+        # Auto-fit column widths
+        for i, column_cells in enumerate(ws.columns, start=1):
+            max_length = 0
+            for cell in column_cells:
+                try:
+                    val = str(cell.value) if cell.value is not None else ''
+                except Exception:
+                    val = ''
+                if len(val) > max_length:
+                    max_length = len(val)
+            ws.column_dimensions[get_column_letter(i)].width = min(max_length + 2, 50)
+
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+
+        filename = f"payout_{start}_{end}.xlsx"
+        resp = HttpResponse(output.getvalue(), content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        resp['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return resp
 
     @action(detail=False, methods=['get'])
     def daily_report(self, request):
-        """Get daily attendance report based on unique employees"""
+        """Get daily attendance report for a specific date (defaults to today)"""
         date_str = request.query_params.get('date')
         today = datetime.now().date()
-        
+
         if not date_str:
             report_date = today
         else:
@@ -536,8 +916,8 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
         attendances = Attendance.objects.filter(date=report_date)
         total_active_employees = Employee.objects.filter(status='active').count()
-        
-        # FIX: Count UNIQUE employees present today
+
+        # Count UNIQUE employees present today
         present_count = attendances.values('employee').distinct().count()
         total_hours = round(sum(att.total_hours for att in attendances), 2)
 
@@ -556,6 +936,15 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 continue
 
             if report_date < today or (report_date == today and current_time >= employee.end_time):
+                # Check approved paid leaves covering this date
+                on_leave = PaidLeave.objects.filter(
+                    employee=employee,
+                    approved=True,
+                    start_time__date__lte=report_date,
+                    end_time__date__gte=report_date,
+                ).exists()
+
+                status_val = "on_leave" if on_leave else "absent"
                 absent_details.append({
                     "id": None,
                     "employee": employee.emp_id,
@@ -564,7 +953,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                     "check_in": None,
                     "check_out": None,
                     "message_late": None,
-                    "status": "absent",
+                    "status": status_val,
                     "total_hours": "0h 0m",
                     "is_late": False,
                     "created_at": None,
@@ -574,8 +963,8 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 pending_count += 1
 
         absent_count = len(absent_details)
-        
-        # FIX: Count how many UNIQUE employees were late at least once today
+
+        # Count how many UNIQUE employees were late at least once today
         late_count = attendances.filter(status='late').values('employee').distinct().count()
         on_time_count = present_count - late_count
 
@@ -651,6 +1040,115 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             "average_daily_attendance": round(unique_working_days / unique_employees, 2) if unique_employees > 0 else 0
         })
 
+    @action(detail=False, methods=['post'], permission_classes=[IsAdmin])
+    def mark_absent(self, request):
+        """Mark absent for employees who have no attendance and no approved leave.
+
+        POST params:
+        - date (YYYY-MM-DD) OR date_from/date_to
+        - employees (optional comma-separated emp_id list) or employee (single emp_id)
+        """
+        # parse date range
+        date_str = request.data.get('date') or request.query_params.get('date')
+        start = request.data.get('date_from') or request.query_params.get('date_from')
+        end = request.data.get('date_to') or request.query_params.get('date_to')
+
+        if date_str:
+            try:
+                start_date = end_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+            except ValueError:
+                return Response({"error": "Invalid date format"}, status=400)
+        elif start and end:
+            try:
+                start_date = datetime.strptime(start, '%Y-%m-%d').date()
+                end_date = datetime.strptime(end, '%Y-%m-%d').date()
+            except ValueError:
+                return Response({"error": "Invalid date format"}, status=400)
+        else:
+            return Response({"error": "Provide date or date_from and date_to (YYYY-MM-DD)"}, status=400)
+
+        # employees filter
+        emp_single = request.data.get('employee') or request.query_params.get('employee')
+        emp_param = request.data.get('employees') or request.query_params.get('employees')
+        if emp_single and str(emp_single).strip().isdigit():
+            employees = list(Employee.objects.filter(emp_id=int(emp_single)).order_by('emp_id'))
+        elif emp_param:
+            emp_ids = [int(x.strip()) for x in str(emp_param).split(',') if x.strip().isdigit()]
+            employees = list(Employee.objects.filter(emp_id__in=emp_ids).order_by('emp_id'))
+        else:
+            employees = list(Employee.objects.filter(status='active').order_by('emp_id'))
+
+        created = []
+        skipped = []
+
+        delta = (end_date - start_date).days
+        for d_offset in range(delta + 1):
+            rdate = start_date + timedelta(days=d_offset)
+            for emp in employees:
+                # If no shift times, still create absent record (use midnight as check_in)
+                if not emp.start_time or not emp.end_time:
+                    # but if an attendance exists or leave exists skip
+                    exists = Attendance.objects.filter(employee=emp).filter(
+                        Q(date=rdate) | Q(check_in__date=rdate)
+                    ).exists()
+                    on_leave = PaidLeave.objects.filter(
+                        employee=emp,
+                        approved=True,
+                        start_time__date__lte=rdate,
+                        end_time__date__gte=rdate,
+                    ).exists()
+                    if exists:
+                        skipped.append({"employee": emp.emp_id, "date": rdate.isoformat(), "reason": "has_attendance"})
+                        continue
+                    if on_leave:
+                        skipped.append({"employee": emp.emp_id, "date": rdate.isoformat(), "reason": "on_leave"})
+                        continue
+                    # create absent record with midnight check_in
+                    check_dt = datetime.combine(rdate, time(0, 0))
+                    att = Attendance.objects.create(
+                        employee=emp,
+                        date=rdate,
+                        check_in=check_dt,
+                        check_out=check_dt,
+                        status='absent',
+                        message_late='Marked absent by system'
+                    )
+                    created.append({"employee": emp.emp_id, "date": rdate.isoformat(), "id": att.id})
+                    continue
+
+                # if attendance exists for this date (either stored date or check_in date), skip
+                exists = Attendance.objects.filter(employee=emp).filter(
+                    Q(date=rdate) | Q(check_in__date=rdate)
+                ).exists()
+                if exists:
+                    skipped.append({"employee": emp.emp_id, "date": rdate.isoformat(), "reason": "has_attendance"})
+                    continue
+
+                # if approved leave exists, skip
+                on_leave = PaidLeave.objects.filter(
+                    employee=emp,
+                    approved=True,
+                    start_time__date__lte=rdate,
+                    end_time__date__gte=rdate,
+                ).exists()
+                if on_leave:
+                    skipped.append({"employee": emp.emp_id, "date": rdate.isoformat(), "reason": "on_leave"})
+                    continue
+
+                # create absent attendance record with zero duration (check_in==check_out at shift start)
+                check_dt = datetime.combine(rdate, emp.start_time)
+                att = Attendance.objects.create(
+                    employee=emp,
+                    date=rdate,
+                    check_in=check_dt,
+                    check_out=check_dt,
+                    status='absent',
+                    message_late='Marked absent by system'
+                )
+                created.append({"employee": emp.emp_id, "date": rdate.isoformat(), "id": att.id})
+
+        return Response({"created_count": len(created), "created": created, "skipped": skipped})
+
     @action(detail=False, methods=['post'], permission_classes=[AllowAny])
     def check_in(self, request):
         """Check in an employee"""
@@ -672,23 +1170,97 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
         today = timezone.now().date()
         now = timezone.now()
-        current_time = now.time()
 
-        # Check if already checked in today
-        existing = Attendance.objects.filter(employee=employee, date=today).first()
-        if existing:
+        # Consider the latest attendance record regardless of date so an open check-in
+        # on a previous date will be treated as the next action's check-out.
+        last_att = Attendance.objects.filter(employee=employee).order_by('-check_in').first()
+
+        # If there's an open attendance (no check_out), treat this request as a check-out
+        if last_att and last_att.check_out is None:
+            duration = (now - last_att.check_in).total_seconds() / 3600
+            if duration > 14:
+                # Auto-check-out at shift end and create a new attendance (check-in)
+                # Determine shift end datetime based on last_att.date and employee.end_time
+                if getattr(employee, 'end_time', None):
+                    shift_end_dt = datetime.combine(last_att.date, employee.end_time)
+                    # If overnight shift, end_time may be on next day
+                    if getattr(employee, 'start_time', None) and employee.end_time <= employee.start_time:
+                        shift_end_dt += timedelta(days=1)
+                else:
+                    # Fallback: cap at 14 hours after check_in
+                    shift_end_dt = last_att.check_in + timedelta(hours=14)
+
+                # Ensure shift_end_dt is not in the future beyond 'now'
+                if shift_end_dt > now:
+                    shift_end_dt = now
+
+                # Mark previous attendance as checked out at shift_end_dt and log the auto action in message_late
+                prev_msg = last_att.message_late or ''
+                try:
+                    missing_date = last_att.check_in.date()
+                except Exception:
+                    missing_date = last_att.date
+                missing_note = f"you haven't checked out {missing_date.strftime('%Y-%m-%d')}"
+                last_att.check_out = shift_end_dt
+                last_att.message_late = (prev_msg + ' | ' + missing_note).strip(' |')
+                last_att.save()
+
+                # Create a new attendance record representing the new check-in (current scan)
+                new_status = 'on_time'
+                new_late_msg = None
+                if employee.start_time:
+                    # Determine lateness for the new check-in against today's shift start
+                    new_shift_start = datetime.combine(now.date(), employee.start_time)
+                    if getattr(employee, 'end_time', None) and employee.end_time <= employee.start_time and new_shift_start > now:
+                        new_shift_start -= timedelta(days=1)
+                    is_late_new = now > new_shift_start
+                    new_status = 'late' if is_late_new else 'on_time'
+                    if is_late_new:
+                        mins = int((now - new_shift_start).total_seconds() / 60)
+                        new_late_msg = f"you are late {mins}m"
+
+                new_att = Attendance.objects.create(
+                    employee=employee,
+                    date=now.date(),
+                    check_in=now,
+                    status=new_status,
+                    message_late=new_late_msg
+                )
+
+                total_hours_prev = round(min((last_att.check_out - last_att.check_in).total_seconds() / 3600, 14.0), 2)
+
+                return Response(
+                    {
+                        "message": "Auto check-out performed and new check-in created",
+                        "previous_record": AttendanceSerializer(last_att).data,
+                        "new_record": AttendanceSerializer(new_att).data,
+                        "previous_total_hours": format_hours_display(total_hours_prev),
+                        "previous_total_hours_value": total_hours_prev
+                    },
+                    status=status.HTTP_200_OK
+                )
+
+            # Normal check-out within 14 hours
+            last_att.check_out = now
+            last_att.save()
+
+            total_hours = round(min((now - last_att.check_in).total_seconds() / 3600, 14.0), 2)
+
             return Response(
-                {"error": "Already checked in today", "record": AttendanceSerializer(existing).data},
-                status=status.HTTP_400_BAD_REQUEST
+                {
+                    "message": "Check-out successful",
+                    "total_hours": format_hours_display(total_hours),
+                    "total_hours_value": total_hours,
+                    "record": AttendanceSerializer(last_att).data
+                },
+                status=status.HTTP_200_OK
             )
 
-        # Determine lateness considering overnight shifts (start_time may be before midnight)
+        # Otherwise create a new check-in. Determine lateness and present minutes-based message.
         status_val = 'on_time'
         late_msg = None
         if employee.start_time:
             shift_start_dt = datetime.combine(today, employee.start_time)
-            # If shift crosses midnight (end_time <= start_time) and shift_start is after now,
-            # assume the shift started the previous day.
             if getattr(employee, 'end_time', None) and employee.end_time <= employee.start_time and shift_start_dt > now:
                 shift_start_dt -= timedelta(days=1)
 
@@ -696,12 +1268,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             status_val = 'late' if is_late else 'on_time'
             if is_late:
                 minutes_late = int((now - shift_start_dt).total_seconds() / 60)
-                if minutes_late >= 60:
-                    hours = minutes_late // 60
-                    minutes = minutes_late % 60
-                    late_msg = f"{hours}h {minutes}m late" if minutes else f"{hours}h late"
-                else:
-                    late_msg = f"{minutes_late}m late"
+                late_msg = f"you are late {minutes_late}m"
 
         attendance = Attendance.objects.create(
             employee=employee,
@@ -717,25 +1284,6 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 "record": AttendanceSerializer(attendance).data,
             },
             status=status.HTTP_201_CREATED
-        )
-
-        if attendance.check_out:
-            return Response(
-                {"error": "Already checked out today"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        attendance.check_out = now
-        attendance.save()
-
-        return Response(
-            {
-                "message": "Check-out successful",
-                "total_hours": format_hours_display(attendance.total_hours),
-                "total_hours_value": attendance.total_hours,
-                "record": AttendanceSerializer(attendance).data
-            },
-            status=status.HTTP_200_OK
         )
 
     @action(detail=False, methods=['post'], permission_classes=[AllowAny])
@@ -755,8 +1303,12 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         today = now.date()
         current_time = now.time()
         
-        last_attendance = Attendance.objects.filter(employee=employee, date=today).order_by('-check_in').first()
-        first_checkin = Attendance.objects.filter(employee=employee, date=today).order_by('check_in').first()
+        # Look for the latest attendance record regardless of date so open check-ins carry over
+        last_attendance = Attendance.objects.filter(employee=employee).order_by('-check_in').first()
+        # For total hours calculation when checking out, use the last open check-in (the same record)
+        first_checkin = None
+        if last_attendance and last_attendance.check_out is None:
+            first_checkin = last_attendance
 
         attendance_info = {
             "emp_id": employee.emp_id,
@@ -853,28 +1405,79 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             # Both are now "naive" datetimes, so math works perfectly
             duration = (now - last_attendance.check_in).total_seconds() / 3600
             if duration > 14:
-                return Response({"error": "Duration exceeds 14-hour limit"}, status=status.HTTP_400_BAD_REQUEST)
-            
-            last_attendance.check_out = now # Saves literal system time to DB
-            last_attendance.save()
-            
-            total_hours = 0
-            if first_checkin:
-                total_duration = (now - first_checkin.check_in).total_seconds() / 3600
-                total_hours = round(min(total_duration, 14.0), 2)
-            
-            action = "check_out"
-            message = "Check-out successful"
-            attendance_info.update({
-                "action": action,
-                # UPDATED: Just use the time in DB directly (it's already local)
-                "check_in": last_attendance.check_in.strftime('%I:%M %p'),
-                "check_out": now.strftime('%I:%M %p'),
-                "is_late": False,
-                "late_message": None,
-                "total_hours_today": format_hours_display(total_hours),
-                "total_hours_today_value": total_hours
-            })
+                # Auto-check-out at shift end and create a new check-in record
+                if getattr(employee, 'end_time', None):
+                    shift_end_dt = datetime.combine(last_attendance.date, employee.end_time)
+                    if getattr(employee, 'start_time', None) and employee.end_time <= employee.start_time:
+                        shift_end_dt += timedelta(days=1)
+                else:
+                    shift_end_dt = last_attendance.check_in + timedelta(hours=14)
+
+                if shift_end_dt > now:
+                    shift_end_dt = now
+
+                prev_msg = last_attendance.message_late or ''
+                try:
+                    missing_date = last_attendance.check_in.date()
+                except Exception:
+                    missing_date = last_attendance.date
+                missing_note = f"you haven't checked out {missing_date.strftime('%Y-%m-%d')}"
+                last_attendance.check_out = shift_end_dt
+                last_attendance.message_late = (prev_msg + ' | ' + missing_note).strip(' |')
+                last_attendance.save()
+
+                # create new attendance as new check-in
+                new_status = 'on_time'
+                new_late_msg = None
+                if employee.start_time:
+                    new_shift_start = datetime.combine(now.date(), employee.start_time)
+                    if getattr(employee, 'end_time', None) and employee.end_time <= employee.start_time and new_shift_start > now:
+                        new_shift_start -= timedelta(days=1)
+                    is_late_new = now > new_shift_start
+                    new_status = 'late' if is_late_new else 'on_time'
+                    if is_late_new:
+                        mins = int((now - new_shift_start).total_seconds() / 60)
+                        new_late_msg = f"you are late {mins}m"
+
+                new_att = Attendance.objects.create(
+                    employee=employee,
+                    date=now.date(),
+                    check_in=now,
+                    status=new_status,
+                    message_late=new_late_msg
+                )
+
+                total_hours = round(min((last_attendance.check_out - last_attendance.check_in).total_seconds() / 3600, 14.0), 2)
+
+                action = "auto_check_out_and_check_in"
+                message = "Auto check-out performed and new check-in created"
+                attendance_info.update({
+                    "previous_record": AttendanceSerializer(last_attendance).data,
+                    "new_record": AttendanceSerializer(new_att).data,
+                    "previous_total_hours": format_hours_display(total_hours),
+                    "previous_total_hours_value": total_hours
+                })
+            else:
+                last_attendance.check_out = now # Saves literal system time to DB
+                last_attendance.save()
+                
+                total_hours = 0
+                if first_checkin:
+                    total_duration = (now - first_checkin.check_in).total_seconds() / 3600
+                    total_hours = round(min(total_duration, 14.0), 2)
+                
+                action = "check_out"
+                message = "Check-out successful"
+                attendance_info.update({
+                    "action": action,
+                    # UPDATED: Just use the time in DB directly (it's already local)
+                    "check_in": last_attendance.check_in.strftime('%I:%M %p'),
+                    "check_out": now.strftime('%I:%M %p'),
+                    "is_late": False,
+                    "late_message": None,
+                    "total_hours_today": format_hours_display(total_hours),
+                    "total_hours_today_value": total_hours
+                })
 
         response_payload = {
             "message": message,
