@@ -4,7 +4,7 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from django_filters import rest_framework as filters
 from django.contrib.auth.models import User
-from .models import Employee, Attendance, PaidLeave, Shift, UserAccessLevel
+from .models import Employee, Attendance, PaidLeave, Shift, UserAccessLevel, InactiveAttendanceAttempt
 from .serializers import (
     EmployeeSerializer, AttendanceSerializer, PaidLeaveSerializer, 
     ShiftSerializer, UserSerializer, UserAccessLevelSerializer,
@@ -18,6 +18,7 @@ from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
 from io import BytesIO
 from django.http import HttpResponse
+import logging
 try:
     import openpyxl
     from openpyxl.utils import get_column_letter
@@ -276,7 +277,7 @@ class EmployeeFilter(filters.FilterSet):
         fields = ['employee_id', 'employee_name', 'status', 'shift_type']
 
 class EmployeeViewSet(viewsets.ModelViewSet):
-    queryset = Employee.objects.all()
+    queryset = Employee.objects.all().order_by('emp_id')
     serializer_class = EmployeeSerializer
     filterset_class = EmployeeFilter
     filter_backends = (filters.DjangoFilterBackend,)
@@ -285,7 +286,21 @@ class EmployeeViewSet(viewsets.ModelViewSet):
 
     def update(self, request, *args, **kwargs):
         kwargs['partial'] = True
-        return super().update(request, *args, **kwargs)
+        # Perform the update first
+        response = super().update(request, *args, **kwargs)
+
+        # If status was set to inactive during this update, record who deactivated and when
+        try:
+            if 'status' in request.data and str(request.data.get('status')).lower() == 'inactive':
+                emp = self.get_object()
+                if not emp.deactivated_at:
+                    emp.deactivated_by = request.user if getattr(request, 'user', None) and request.user.is_authenticated else None
+                    emp.deactivated_at = timezone.now()
+                    emp.save(update_fields=['deactivated_by', 'deactivated_at'])
+        except Exception:
+            pass
+
+        return response
 
     @action(detail=True, methods=['get'])
     def calculate_payout(self, request, emp_id=None):
@@ -332,42 +347,37 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         """Get attendance report for an employee with filters"""
         employee = self.get_object()
         period = request.query_params.get('period', 'month')  # day, week, month, custom
-        
-        today = timezone.now().date()
-        
-        if period == 'day':
-            start_date = today
-            end_date = today
-        elif period == 'week':
-            start_date = today - timedelta(days=today.weekday())
-            end_date = start_date + timedelta(days=6)
-        elif period == 'month':
-            start_date = date(today.year, today.month, 1)
-            if today.month == 12:
-                end_date = date(today.year + 1, 1, 1) - timedelta(days=1)
-            else:
-                end_date = date(today.year, today.month + 1, 1) - timedelta(days=1)
-        elif period == 'custom':
-            start_date_str = request.query_params.get('start_date')
-            end_date_str = request.query_params.get('end_date')
+
+        # If explicit start_date and end_date provided, prefer them regardless of `period`
+        start_date_str = request.query_params.get('start_date')
+        end_date_str = request.query_params.get('end_date')
+        if start_date_str or end_date_str:
             if not start_date_str or not end_date_str:
-                return Response(
-                    {"error": "Please provide start_date and end_date for custom period"},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
+                return Response({"error": "Please provide both start_date and end_date (YYYY-MM-DD)"}, status=status.HTTP_400_BAD_REQUEST)
             try:
                 start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
                 end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
             except ValueError:
-                return Response(
-                    {"error": "Invalid date format. Use YYYY-MM-DD"},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
+                return Response({"error": "Invalid date format. Use YYYY-MM-DD"}, status=status.HTTP_400_BAD_REQUEST)
         else:
-            return Response(
-                {"error": "Invalid period. Use: day, week, month, or custom"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            today = timezone.now().date()
+            if period == 'day':
+                start_date = today
+                end_date = today
+            elif period == 'week':
+                start_date = today - timedelta(days=today.weekday())
+                end_date = start_date + timedelta(days=6)
+            elif period == 'month':
+                start_date = date(today.year, today.month, 1)
+                if today.month == 12:
+                    end_date = date(today.year + 1, 1, 1) - timedelta(days=1)
+                else:
+                    end_date = date(today.year, today.month + 1, 1) - timedelta(days=1)
+            elif period == 'custom':
+                # custom without explicit dates is invalid
+                return Response({"error": "Please provide start_date and end_date for custom period"}, status=status.HTTP_400_BAD_REQUEST)
+            else:
+                return Response({"error": "Invalid period. Use: day, week, month, or custom"}, status=status.HTTP_400_BAD_REQUEST)
 
         attendances = Attendance.objects.filter(
             employee=employee,
@@ -542,10 +552,36 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             attendances = qs.filter(date=report_date).order_by('employee', 'check_in')
             serializer = AttendanceSerializer(attendances, many=True, context={'request': request})
             absent_entries, pending_count = build_absent_entries(report_date, request=request)
-
             results = list(serializer.data) + absent_entries
+
+            # Include any inactive-attendance attempts logged for this date
+            inactive_attempts_qs = InactiveAttendanceAttempt.objects.filter(attempted_at__date=report_date)
+            inactive_entries = []
+            for att in inactive_attempts_qs.select_related('employee', 'attempted_by'):
+                attempted_by = att.attempted_by.username if att.attempted_by else None
+                msg = att.message or f"Attempted attendance while inactive by {attempted_by or 'unknown'}"
+                deact_by = att.deactivated_by_username or (att.employee.deactivated_by.username if getattr(att.employee, 'deactivated_by', None) else None)
+                inactive_entries.append({
+                    "id": None,
+                    "employee": att.employee.emp_id,
+                    "employee_name": att.employee.name,
+                    "date": report_date,
+                    "check_in": None,
+                    "check_out": None,
+                    "message_late": msg,
+                    "status": "inactive",
+                    "total_hours": "0h 0m",
+                    "is_late": False,
+                    "created_at": att.attempted_at,
+                    "updated_at": None,
+                    "attempted_by": attempted_by,
+                    "deactivated_by": deact_by,
+                })
+
+            results += inactive_entries
             present_count = attendances.values('employee').distinct().count()
             absent_count = len(absent_entries)
+            inactive_count = len(inactive_entries)
             late_count = attendances.filter(status='late').values('employee').distinct().count()
             on_time_count = max(0, present_count - late_count)
             total_hours = round(sum(att.total_hours for att in attendances), 2)
@@ -554,6 +590,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 "date": report_date,
                 "present": present_count,
                 "absent": absent_count,
+                "inactive_attempts": inactive_count,
                 "pending": pending_count,
                 "on_time": on_time_count,
                 "late": late_count,
@@ -991,6 +1028,16 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
         attendances = Attendance.objects.filter(date__range=[start_date, end_date])
 
+        # Optional employee filter by emp_id
+        emp_param = request.query_params.get('employee')
+        employee_obj = None
+        if emp_param and str(emp_param).strip().isdigit():
+            try:
+                employee_obj = Employee.objects.get(emp_id=int(emp_param))
+                attendances = attendances.filter(employee=employee_obj)
+            except Employee.DoesNotExist:
+                return Response({"error": f"Employee with id {emp_param} not found"}, status=404)
+
         # FIX: Round the total hours to 2 decimal places
         total_hours = round(sum(att.total_hours for att in attendances), 2)
         
@@ -999,6 +1046,8 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         late_arrivals = attendances.filter(status='late').values('employee', 'date').distinct().count()
 
         return Response({
+            "employee_id": employee_obj.emp_id if employee_obj else None,
+            "employee_name": employee_obj.name if employee_obj else None,
             "week": f"{start_date} to {end_date}",
             "total_records": total_working_records,
             "total_hours": format_hours_display(total_hours),
@@ -1020,7 +1069,18 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         else:
             end_date = date(year, month + 1, 1) - timedelta(days=1)
 
+
         attendances = Attendance.objects.filter(date__range=[start_date, end_date])
+
+        # Optional employee filter by emp_id
+        emp_param = request.query_params.get('employee')
+        employee_obj = None
+        if emp_param and str(emp_param).strip().isdigit():
+            try:
+                employee_obj = Employee.objects.get(emp_id=int(emp_param))
+                attendances = attendances.filter(employee=employee_obj)
+            except Employee.DoesNotExist:
+                return Response({"error": f"Employee with id {emp_param} not found"}, status=404)
 
         # FIX: Round total hours
         total_hours = round(sum(att.total_hours for att in attendances), 2)
@@ -1031,6 +1091,8 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         late_arrivals = attendances.filter(status='late').values('employee', 'date').distinct().count()
 
         return Response({
+            "employee_id": employee_obj.emp_id if employee_obj else None,
+            "employee_name": employee_obj.name if employee_obj else None,
             "month": f"{year}-{month:02d}",
             "total_working_days": unique_working_days,
             "total_hours_worked": format_hours_display(total_hours),
@@ -1168,6 +1230,23 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_404_NOT_FOUND
             )
 
+        # Prevent attendance for inactive employees; log the attempt
+        if getattr(employee, 'status', '') != 'active':
+            try:
+                attempted_by = request.user if getattr(request, 'user', None) and request.user.is_authenticated else None
+                InactiveAttendanceAttempt.objects.create(
+                    employee=employee,
+                    attempted_by=attempted_by,
+                    method='check_in',
+                    message='Attempted check-in while employee inactive',
+                    deactivated_by_username=employee.deactivated_by.username if getattr(employee, 'deactivated_by', None) else None,
+                    deactivated_at=employee.deactivated_at
+                )
+            except Exception:
+                pass
+
+            return Response({"error": "Employee is inactive. Attempt has been logged."}, status=status.HTTP_403_FORBIDDEN)
+
         today = timezone.now().date()
         now = timezone.now()
 
@@ -1221,7 +1300,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
                 new_att = Attendance.objects.create(
                     employee=employee,
-                    date=now.date(),
+                    date=timezone.now().date(),
                     check_in=now,
                     status=new_status,
                     message_late=new_late_msg
@@ -1298,8 +1377,48 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         except Employee.DoesNotExist:
             return Response({"error": f"Employee with id {emp_id} not found"}, status=status.HTTP_404_NOT_FOUND)
 
-        # UPDATED: Use system clock time (since USE_TZ = False)
-        now = datetime.now() 
+        # Prevent attendance for inactive employees; log the attempt
+        if getattr(employee, 'status', '') != 'active':
+            try:
+                attempted_by = request.user if getattr(request, 'user', None) and request.user.is_authenticated else None
+                InactiveAttendanceAttempt.objects.create(
+                    employee=employee,
+                    attempted_by=attempted_by,
+                    method='auto_attendance',
+                    message='Attempted auto-attendance while employee inactive',
+                    deactivated_by_username=employee.deactivated_by.username if getattr(employee, 'deactivated_by', None) else None,
+                    deactivated_at=employee.deactivated_at
+                )
+            except Exception:
+                pass
+
+            return Response({"error": "Employee is inactive. Attempt has been logged."}, status=status.HTTP_403_FORBIDDEN)
+
+        # Prefer client-sent timestamp if provided, otherwise use system clock time
+        timestamp_in = request.data.get('timestamp')
+        now = None
+        if timestamp_in:
+            try:
+                # Accept epoch seconds or milliseconds
+                if isinstance(timestamp_in, (int, float)) or str(timestamp_in).isdigit():
+                    now = datetime.fromtimestamp(float(timestamp_in))
+                else:
+                    # Accept ISO formatted string
+                    try:
+                        now = datetime.fromisoformat(str(timestamp_in))
+                    except Exception:
+                        # Fallback to common format
+                        now = datetime.strptime(str(timestamp_in), '%Y-%m-%d %H:%M:%S')
+            except Exception:
+                now = datetime.now()
+        else:
+            now = datetime.now()
+        # Debug logging for timestamp handling
+        logger = logging.getLogger(__name__)
+        try:
+            logger.debug(f"auto_attendance called for emp_id={emp_id}, received_timestamp={timestamp_in}, using_now={now}")
+        except Exception:
+            pass
         today = now.date()
         current_time = now.time()
         
@@ -1319,40 +1438,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         }
         
         # Determine action: Check-in or Check-out
-        # if not last_attendance or (last_attendance.check_out is not None):
-        #     # ===== NEW CHECK-IN =====
-        #     shift_start = employee.start_time
-        #     is_late = current_time > shift_start
-            
-        #     status_val = 'late' if is_late else 'on_time'
-            
-        #     late_msg = "On time"
-        #     if is_late:
-        #         # UPDATED: No timezone awareness needed because USE_TZ = False
-        #         shift_start_dt = datetime.combine(today, shift_start)
-        #         minutes_late = int((now - shift_start_dt).total_seconds() / 60)
-        #         late_msg = f"{minutes_late} minutes late"
-            
-        #     attendance = Attendance.objects.create(
-        #         employee=employee,
-        #         date=today,
-        #         check_in=now, # Saves literal system time to DB
-        #         message_late=late_msg,
-        #         status=status_val
-        #     )
-            
-        #     action = "check_in"
-        #     message = "Check-in successful"
-        #     attendance_info.update({
-        #         "action": action,
-        #         "check_in": now.strftime('%I:%M %p'),
-        #         "check_out": "--:--",
-        #         "is_late": is_late,
-        #         "late_message": late_msg,
-        #         "total_hours_today": 0
-        #     })
-            
-        # Determine action: Check-in or Check-out
+        did_modify = False
         if not last_attendance or (last_attendance.check_out is not None):
             # ===== NEW CHECK-IN =====
             shift_start = employee.start_time
@@ -1378,17 +1464,25 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                             late_msg = f"{hours}h late"
                     else:
                         late_msg = f"{total_minutes}m late"
-            
+
             status_val = 'late' if is_late else 'on_time'
 
-            attendance = Attendance.objects.create(
-                employee=employee,
-                date=today,
-                check_in=now,
-                message_late=late_msg,
-                status=status_val
-            )
-            
+            # Avoid duplicate creation if a record with near-identical check_in exists
+            window_start = now - timedelta(seconds=5)
+            window_end = now + timedelta(seconds=5)
+            existing = Attendance.objects.filter(employee=employee, check_in__range=[window_start, window_end]).first()
+            if existing:
+                attendance = existing
+            else:
+                attendance = Attendance.objects.create(
+                    employee=employee,
+                    date=today,
+                    check_in=now,
+                    message_late=late_msg,
+                    status=status_val
+                )
+                did_modify = True
+
             action = "check_in"
             message = "Check-in successful"
             attendance_info.update({
@@ -1402,31 +1496,20 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             })
         elif last_attendance.check_in is not None and last_attendance.check_out is None:
             # ===== CHECK-OUT =====
-            # Both are now "naive" datetimes, so math works perfectly
+            # Debug: log check_in/now before computing duration
+            try:
+                logger.debug(f"Last attendance check_in={last_attendance.check_in}, now={now}")
+            except Exception:
+                pass
             duration = (now - last_attendance.check_in).total_seconds() / 3600
+            try:
+                logger.debug(f"Computed duration_hours={duration}")
+            except Exception:
+                pass
+
             if duration > 14:
-                # Auto-check-out at shift end and create a new check-in record
-                if getattr(employee, 'end_time', None):
-                    shift_end_dt = datetime.combine(last_attendance.date, employee.end_time)
-                    if getattr(employee, 'start_time', None) and employee.end_time <= employee.start_time:
-                        shift_end_dt += timedelta(days=1)
-                else:
-                    shift_end_dt = last_attendance.check_in + timedelta(hours=14)
-
-                if shift_end_dt > now:
-                    shift_end_dt = now
-
-                prev_msg = last_attendance.message_late or ''
-                try:
-                    missing_date = last_attendance.check_in.date()
-                except Exception:
-                    missing_date = last_attendance.date
-                missing_note = f"you haven't checked out {missing_date.strftime('%Y-%m-%d')}"
-                last_attendance.check_out = shift_end_dt
-                last_attendance.message_late = (prev_msg + ' | ' + missing_note).strip(' |')
-                last_attendance.save()
-
-                # create new attendance as new check-in
+                # Do NOT auto-fill previous record's check_out; leave it open.
+                # Create a new attendance record for the new check-in.
                 new_status = 'on_time'
                 new_late_msg = None
                 if employee.start_time:
@@ -1439,33 +1522,44 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                         mins = int((now - new_shift_start).total_seconds() / 60)
                         new_late_msg = f"you are late {mins}m"
 
-                new_att = Attendance.objects.create(
-                    employee=employee,
-                    date=now.date(),
-                    check_in=now,
-                    status=new_status,
-                    message_late=new_late_msg
-                )
+                # Deduplicate new check-in creation
+                window_start = now - timedelta(seconds=5)
+                window_end = now + timedelta(seconds=5)
+                existing_new = Attendance.objects.filter(employee=employee, check_in__range=[window_start, window_end]).first()
+                if existing_new:
+                    new_att = existing_new
+                else:
+                    new_att = Attendance.objects.create(
+                        employee=employee,
+                        date=timezone.now().date(),
+                        check_in=now,
+                        status=new_status,
+                        message_late=new_late_msg
+                    )
+                    did_modify = True
 
-                total_hours = round(min((last_attendance.check_out - last_attendance.check_in).total_seconds() / 3600, 14.0), 2)
-
-                action = "auto_check_out_and_check_in"
-                message = "Auto check-out performed and new check-in created"
+                # Keep response shape identical to a normal check-in response
+                action = "check_in"
+                message = "Check-in successful"
                 attendance_info.update({
-                    "previous_record": AttendanceSerializer(last_attendance).data,
-                    "new_record": AttendanceSerializer(new_att).data,
-                    "previous_total_hours": format_hours_display(total_hours),
-                    "previous_total_hours_value": total_hours
+                    "action": action,
+                    "check_in": new_att.check_in.strftime('%I:%M %p'),
+                    "check_out": "--:--",
+                    "is_late": True if new_status == 'late' else False,
+                    "late_message": new_late_msg,
+                    "total_hours_today": "0h 0m",
+                    "total_hours_today_value": 0
                 })
             else:
                 last_attendance.check_out = now # Saves literal system time to DB
                 last_attendance.save()
-                
+                did_modify = True
+
                 total_hours = 0
                 if first_checkin:
                     total_duration = (now - first_checkin.check_in).total_seconds() / 3600
                     total_hours = round(min(total_duration, 14.0), 2)
-                
+
                 action = "check_out"
                 message = "Check-out successful"
                 attendance_info.update({
@@ -1485,18 +1579,19 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             "data": attendance_info
         }
 
-        # Broadcast to WebSocket
-        try:
-            channel_layer = get_channel_layer()
-            async_to_sync(channel_layer.group_send)(
-                "biometric_device",
-                {
-                    "type": "biometric_event",
-                    "data": attendance_info 
-                }
-            )
-        except Exception as e:
-            print(f"WS Error: {e}")
+        # Broadcast to WebSocket only if we created or updated a record
+        if did_modify:
+            try:
+                channel_layer = get_channel_layer()
+                async_to_sync(channel_layer.group_send)(
+                    "biometric_device",
+                    {
+                        "type": "biometric_event",
+                        "data": attendance_info 
+                    }
+                )
+            except Exception as e:
+                print(f"WS Error: {e}")
 
         return Response(response_payload, status=status.HTTP_200_OK)
 

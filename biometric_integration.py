@@ -228,14 +228,13 @@ import time
 import requests
 import logging
 from zk import ZK, const
-
+from fdpp_ems.fdpp_ems.settings import SERVER_IP, SERVER_PORT
 # ============ CONFIGURATION ============
-DEVICE_IP = '172.172.173.199'  # Your Biometric Device IP
+DEVICE_IP = '192.168.1.199'  # Your Biometric Device IP
 DEVICE_PORT = 4370
 
 # SERVER CONFIGURATION (Must match your Django Server)
-SERVER_IP = '172.172.172.160' 
-SERVER_PORT = '8000'
+
 SERVER_URL = f"http://{SERVER_IP}:{SERVER_PORT}/api/attendance/auto_attendance/"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -260,10 +259,16 @@ class BiometricMonitor:
             logger.error(f"❌ Connection Failed: {e}")
             return False
 
-    def call_server(self, emp_id):
+    def call_server(self, emp_id, timestamp=None):
         """This mimics the Postman request"""
         try:
             payload = {"emp_id": int(emp_id)}
+            if timestamp:
+                try:
+                    # send ISO string for server parsing
+                    payload['timestamp'] = timestamp.isoformat()
+                except Exception:
+                    payload['timestamp'] = str(timestamp)
             response = requests.post(self.server_url, json=payload, timeout=5)
             
             if response.status_code == 200:
@@ -302,8 +307,8 @@ class BiometricMonitor:
                     # New scans found
                     new_records = attendance[self.last_count:]
                     for log in new_records:
-                        logger.info(f"📡 New Scan Detected: User ID {log.user_id}")
-                        self.call_server(log.user_id)
+                        logger.info(f"📡 New Scan Detected: User ID {log.user_id} at {log.timestamp}")
+                        self.call_server(log.user_id, getattr(log, 'timestamp', None))
                     
                     self.last_count = len(attendance)
                 

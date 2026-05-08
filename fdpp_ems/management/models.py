@@ -81,6 +81,15 @@ class Employee(models.Model):
         null=True,
         blank=True,
     )
+    # Track deactivation metadata when status is set to 'inactive'
+    deactivated_by = models.ForeignKey(
+        User,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='deactivated_employees'
+    )
+    deactivated_at = models.DateTimeField(null=True, blank=True)
     date_joined = models.DateField(null=True, blank=True, default=None)
     last_modified = models.DateTimeField(auto_now=True)
 
@@ -102,6 +111,30 @@ class Employee(models.Model):
         today = timezone.now().date()
         today_attendance = self.attendances.filter(date=today)
         return sum(att.total_hours for att in today_attendance)
+
+
+class InactiveAttendanceAttempt(models.Model):
+    """Log when an inactive employee attempts to make attendance."""
+    employee = models.ForeignKey(
+        Employee,
+        on_delete=models.CASCADE,
+        related_name='inactive_attempts',
+        to_field='emp_id'
+    )
+    attempted_at = models.DateTimeField(auto_now_add=True)
+    attempted_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL)
+    method = models.CharField(max_length=50, null=True, blank=True)
+    message = models.TextField(null=True, blank=True)
+
+    # Snapshot of who deactivated and when (copied from Employee at time of attempt)
+    deactivated_by_username = models.CharField(max_length=150, null=True, blank=True)
+    deactivated_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-attempted_at']
+
+    def __str__(self):
+        return f"InactiveAttempt: {self.employee.emp_id} at {self.attempted_at}"
 
 
 @receiver(pre_save, sender=Employee)
