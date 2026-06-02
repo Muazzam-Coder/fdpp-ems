@@ -44,7 +44,7 @@ load_env_file(BASE_DIR.parent / '.env')
 SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-(p2krps2z*kc$0s1_ink@4)0&@e$m=yg(ulhe(ekecznw580#s')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = False
 
 SERVER_IP = os.environ['SERVER_IP']
 SERVER_PORT = int(os.environ['SERVER_PORT'])
@@ -196,6 +196,9 @@ REST_FRAMEWORK = {
         'rest_framework.permissions.IsAuthenticated',
     ],
 }
+
+# Use custom DRF exception handler to provide friendlier 404 messages
+REST_FRAMEWORK['EXCEPTION_HANDLER'] = 'management.exception_handlers.custom_exception_handler'
 
 # JWT Configuration
 from datetime import timedelta

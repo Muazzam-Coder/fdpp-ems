@@ -2,6 +2,7 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.decorators import api_view, permission_classes
 from django_filters import rest_framework as filters
 from django.contrib.auth.models import User
 from .models import Employee, Attendance, PaidLeave, Shift, UserAccessLevel, InactiveAttendanceAttempt
@@ -524,8 +525,21 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         data = [{"emp_id": r.emp_id, "name": r.name} for r in relatives_qs.order_by('emp_id')]
         return Response({"relatives": data})
 
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def employee_list(request):
+    """Return a simple list of all employees with `id` (emp_id) and `name`.
+
+    No pagination is applied — returns the full list.
+    The `id` field equals the employee `emp_id` as requested.
+    """
+    employees = Employee.objects.all().order_by('emp_id')
+    data = [{"emp_id": e.emp_id, "name": e.name} for e in employees]
+    return Response(data)
+
 class AttendanceViewSet(viewsets.ModelViewSet):
-    queryset = Attendance.objects.all().order_by('-date')
+    queryset = Attendance.objects.all().order_by('date')
     serializer_class = AttendanceSerializer
     filter_backends = (filters.DjangoFilterBackend,)
     filterset_class = AttendanceFilter
@@ -601,7 +615,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             })
 
         # Multi-day / filtered list: use filtered queryset and support pagination
-        queryset = qs.order_by('-date', 'employee', 'check_in')
+        queryset = qs.order_by('date', 'employee', 'check_in')
 
         # Compute aggregates on full queryset (not just page)
         total_hours = round(sum(att.total_hours for att in queryset), 2)

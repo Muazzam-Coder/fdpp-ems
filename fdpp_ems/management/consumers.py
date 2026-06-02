@@ -239,21 +239,9 @@ class BiometricConsumer(AsyncWebsocketConsumer):
                         "total_hours_today_value": total_hours
                     })
 
-            # Broadcast/update only if we created/updated DB
-            if did_modify:
-                try:
-                    from asgiref.sync import async_to_sync
-                    from channels.layers import get_channel_layer
-                    channel_layer = get_channel_layer()
-                    async_to_sync(channel_layer.group_send)(
-                        "biometric_device",
-                        {
-                            "type": "biometric_event",
-                            "data": attendance_info
-                        }
-                    )
-                except Exception:
-                    pass
+            # Note: broadcasting to the channel layer is handled by the async
+            # consumer layer (receive/biometric_event). Avoid sending here to
+            # prevent duplicate messages to connected clients.
 
             return attendance_info
         except Exception as e:

@@ -4,6 +4,7 @@ from .views import (
     EmployeeViewSet, AttendanceViewSet, PaidLeaveViewSet, ShiftViewSet, 
     AuthViewSet, UserAccessLevelViewSet
 )
+from .views import employee_list
 
 router = DefaultRouter()
 router.register(r'auth', AuthViewSet, basename='auth')
@@ -16,5 +17,6 @@ router.register(r'shifts', ShiftViewSet, basename='shift')
 router.register(r'access-levels', UserAccessLevelViewSet, basename='access-level')
 
 urlpatterns = [
+    path('employee_list/', employee_list, name='employee_list'),
     path('', include(router.urls)),
 ]
