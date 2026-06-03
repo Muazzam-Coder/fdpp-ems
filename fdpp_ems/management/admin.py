@@ -1,5 +1,6 @@
 from django.contrib import admin
-from .models import Employee, Attendance, PaidLeave, Shift, UserAccessLevel
+from .models import Employee, Attendance, PaidLeave, Shift, UserAccessLevel, EmployeeShiftHistory, Holiday, Overtime
+
 
 @admin.register(UserAccessLevel)
 class UserAccessLevelAdmin(admin.ModelAdmin):
@@ -21,10 +22,11 @@ class UserAccessLevelAdmin(admin.ModelAdmin):
         }),
     )
 
+
 @admin.register(Employee)
 class EmployeeAdmin(admin.ModelAdmin):
-    list_display = ['emp_id', 'name', 'designation', 'shift_type', 'status', 'date_joined']
-    list_filter = ['status', 'designation', 'shift_type', 'date_joined']
+    list_display = ['emp_id', 'name', 'designation', 'current_shift', 'weekly_off_day', 'status', 'date_joined']
+    list_filter = ['status', 'designation', 'current_shift', 'date_joined']
     search_fields = ['emp_id', 'name', 'designation', 'CNIC', 'phone']
     readonly_fields = ['emp_id', 'last_modified']
     fieldsets = (
@@ -38,7 +40,7 @@ class EmployeeAdmin(admin.ModelAdmin):
             'fields': ['relative', 'r_phone', 'r_address']
         }),
         ('Shift Information', {
-            'fields': ['shift_type', 'start_time', 'end_time']
+            'fields': ['current_shift', 'weekly_off_day']
         }),
         ('Financial Information', {
             'fields': ['salary', 'hourly_rate']
@@ -48,10 +50,11 @@ class EmployeeAdmin(admin.ModelAdmin):
         }),
     )
 
+
 @admin.register(Attendance)
 class AttendanceAdmin(admin.ModelAdmin):
     list_display = ['date', 'employee', 'check_in', 'check_out', 'total_hours', 'status']
-    list_filter = ['date', 'status', 'employee__shift_type']
+    list_filter = ['date', 'status', 'employee__current_shift']
     search_fields = ['employee__emp_id', 'employee__name']
     readonly_fields = ['total_hours', 'overtime_hours', 'is_late', 'created_at', 'updated_at']
     
@@ -71,6 +74,7 @@ class AttendanceAdmin(admin.ModelAdmin):
             'classes': ['collapse']
         }),
     )
+
 
 @admin.register(PaidLeave)
 class PaidLeaveAdmin(admin.ModelAdmin):
@@ -98,7 +102,31 @@ class PaidLeaveAdmin(admin.ModelAdmin):
         }),
     )
 
+
 @admin.register(Shift)
 class ShiftAdmin(admin.ModelAdmin):
     list_display = ['name', 'start_time', 'end_time']
     search_fields = ['name']
+
+
+@admin.register(EmployeeShiftHistory)
+class EmployeeShiftHistoryAdmin(admin.ModelAdmin):
+    list_display = ['employee', 'shift', 'from_date', 'to_date', 'salary']
+    list_filter = ['shift', 'from_date', 'to_date']
+    search_fields = ['employee__name', 'employee__emp_id', 'shift__name']
+    readonly_fields = ['salary', 'shift_start_time', 'shift_end_time']
+    autocomplete_fields = ['employee', 'shift']
+
+
+@admin.register(Holiday)
+class HolidayAdmin(admin.ModelAdmin):
+    list_display = ['date', 'name', 'is_paid']
+    list_filter = ['is_paid', 'date']
+    search_fields = ['name']
+
+
+@admin.register(Overtime)
+class OvertimeAdmin(admin.ModelAdmin):
+    list_display = ['employee', 'date', 'start_time', 'end_time', 'status', 'approved_by']
+    list_filter = ['status', 'date']
+    search_fields = ['employee__name', 'employee__emp_id']

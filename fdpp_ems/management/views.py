@@ -5,11 +5,12 @@ from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.decorators import api_view, permission_classes
 from django_filters import rest_framework as filters
 from django.contrib.auth.models import User
-from .models import Employee, Attendance, PaidLeave, Shift, UserAccessLevel, InactiveAttendanceAttempt
+from .models import Employee, Attendance, PaidLeave, Shift, UserAccessLevel, InactiveAttendanceAttempt, EmployeeShiftHistory, Holiday, Overtime
 from .serializers import (
     EmployeeSerializer, AttendanceSerializer, PaidLeaveSerializer, 
     ShiftSerializer, UserSerializer, UserAccessLevelSerializer,
-    CreateAdminManagerSerializer, RegisterSerializer
+    CreateAdminManagerSerializer, RegisterSerializer,
+    EmployeeShiftHistorySerializer, HolidaySerializer, OvertimeSerializer,
 )
 from django.db.models import Sum, Count, Q, Avg
 from datetime import datetime, timedelta, date, time
@@ -44,6 +45,24 @@ def format_hours_display(hours_value):
     return f'{hours}h {minutes}m'
 
 
+def get_employee_shift_times(employee, target_date=None):
+    """Get shift start/end times for an employee, using EmployeeShiftHistory.
+
+    Returns (start_time, end_time) or (None, None) if no shift found.
+    """
+    if target_date:
+        entry = employee.get_shift_for_date(target_date)
+    else:
+        entry = employee.get_active_shift_entry()
+
+    if entry and entry.shift:
+        return (entry.shift_start_time or entry.shift.start_time,
+                entry.shift_end_time or entry.shift.end_time)
+    if employee.current_shift:
+        return (employee.current_shift.start_time, employee.current_shift.end_time)
+    return (None, None)
+
+
 def build_absent_entries(report_date, request=None):
     """Build synthetic absent rows for active employees who missed the shift."""
     current_time = datetime.now().time()
@@ -60,8 +79,8 @@ def build_absent_entries(report_date, request=None):
         if employee.emp_id in present_employee_ids:
             continue
 
-        # If employee has no defined shift times, decide pending vs absent based on date
-        if not employee.start_time or not employee.end_time:
+        shift_entry = employee.get_shift_for_date(report_date)
+        if not shift_entry or not shift_entry.shift_start_time or not shift_entry.shift_end_time:
             if report_date < today:
                 on_leave = PaidLeave.objects.filter(
                     employee=employee,
@@ -88,8 +107,7 @@ def build_absent_entries(report_date, request=None):
                 pending_count += 1
             continue
 
-        if report_date < today or (report_date == today and current_time >= employee.end_time):
-            # Check if employee has an approved paid leave covering this date
+        if report_date < today or (report_date == today and current_time >= shift_entry.shift_end_time):
             on_leave = PaidLeave.objects.filter(
                 employee=employee,
                 approved=True,
@@ -151,8 +169,8 @@ class AuthViewSet(viewsets.ViewSet):
                     "phone": employee.phone,
                     "CNIC": employee.CNIC,
                     "shift_type": employee.shift_type,
-                    "start_time": employee.start_time.strftime('%H:%M:%S') if employee.start_time else None,
-                    "end_time": employee.end_time.strftime('%H:%M:%S') if employee.end_time else None,
+                    "current_shift": employee.current_shift.id if employee.current_shift else None,
+                    "current_shift_name": employee.current_shift.name if employee.current_shift else None,
                     "profile_img": f"http://{settings.SERVER_IP}:{settings.SERVER_PORT}{employee.profile_img.url}" if employee.profile_img else None
                 }
             }, status=status.HTTP_201_CREATED)
@@ -272,10 +290,11 @@ class EmployeeFilter(filters.FilterSet):
     employee_id = filters.NumberFilter(field_name="emp_id", lookup_expr='exact')
     employee_name = filters.CharFilter(field_name="name", lookup_expr='icontains')
     status = filters.CharFilter(field_name="status")
+    current_shift = filters.NumberFilter(field_name="current_shift__id")
 
     class Meta:
         model = Employee
-        fields = ['employee_id', 'employee_name', 'status', 'shift_type']
+        fields = ['employee_id', 'employee_name', 'status', 'current_shift']
 
 class EmployeeViewSet(viewsets.ModelViewSet):
     queryset = Employee.objects.all().order_by('emp_id')
@@ -305,7 +324,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['get'])
     def calculate_payout(self, request, emp_id=None):
-        """Calculates salary based on attendance and hourly rate."""
+        """Calculates salary based on shift history, attendance, holidays, leaves, and overtime."""
         employee = self.get_object()
         start_date = request.query_params.get('start_date')
         end_date = request.query_params.get('end_date')
@@ -325,22 +344,198 @@ class EmployeeViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        attendances = Attendance.objects.filter(
-            employee=employee, 
-            date__range=[start_date, end_date]
-        )
-        
-        total_worked_hours = round(sum(att.total_hours for att in attendances), 2)
-        payout = float(total_worked_hours) * float(employee.hourly_rate or 0)
+        if start_date > end_date:
+            return Response(
+                {"error": "start_date must be before end_date"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        def days_in_month(d):
+            if d.month == 12:
+                return (date(d.year + 1, 1, 1) - date(d.year, 12, 1)).days
+            return (date(d.year, d.month + 1, 1) - date(d.year, d.month, 1)).days
+
+        def month_days_for_period(p_start, p_end):
+            total = 0
+            current = p_start
+            while current <= p_end:
+                total += days_in_month(current)
+                current = date(current.year, current.month + 1, 1)
+            return total / ((p_end - p_start).days + 1) if p_start == p_end else total
+
+        shift_entries = EmployeeShiftHistory.objects.filter(
+            employee=employee,
+            from_date__lte=end_date
+        ).filter(
+            models.Q(to_date__isnull=True) | models.Q(to_date__gte=start_date)
+        ).order_by('from_date')
+
+        total_payout = 0.0
+        total_present_days = 0
+        total_absent_days = 0
+        total_holiday_pay = 0.0
+        total_leave_pay = 0.0
+        total_off_day_pay = 0.0
+        total_overtime_pay = 0.0
+        periods_data = []
+        weekly_off = employee.weekly_off_day
+
+        for entry in shift_entries:
+            period_start = max(entry.from_date, start_date)
+            period_end = entry.to_date if entry.to_date and entry.to_date < end_date else end_date
+
+            if period_start > period_end:
+                continue
+
+            shift = entry.shift
+            if not shift:
+                continue
+
+            shift_start_time = entry.shift_start_time or shift.start_time
+            shift_end_time = entry.shift_end_time or shift.end_time
+            shift_seconds = (datetime.combine(date.today(), shift_end_time) -
+                             datetime.combine(date.today(), shift_start_time)).total_seconds()
+            if shift_seconds <= 0:
+                shift_seconds += 86400  # cross-midnight
+            shift_hours = shift_seconds / 3600
+
+            period_days = (period_end - period_start).days + 1
+            weekly_off_count = 0
+            if weekly_off is not None:
+                d = period_start
+                while d <= period_end:
+                    if d.weekday() == weekly_off:
+                        weekly_off_count += 1
+                    d += timedelta(days=1)
+
+            working_days = period_days - weekly_off_count
+            expected_hours = working_days * shift_hours
+
+            # Calculate salary portion based on month days
+            monthly_days = month_days_for_period(period_start, period_end)
+            salary_value = float(entry.salary or 0)
+            salary_portion = salary_value * (period_days / monthly_days) if monthly_days > 0 else 0
+            hourly_rate = salary_portion / expected_hours if expected_hours > 0 else 0
+
+            period_present = 0
+            period_absent = 0
+            period_holiday_pay = 0.0
+            period_leave_pay = 0.0
+            period_off_day_pay = 0.0
+            period_overtime_pay = 0.0
+            period_regular_pay = 0.0
+            period_worked_hours = 0.0
+
+            holidays = {h.date: h for h in Holiday.objects.filter(
+                date__gte=period_start, date__lte=period_end, is_paid=True
+            )}
+
+            overtimes = {
+                (ot.date, ot.start_time): ot
+                for ot in Overtime.objects.filter(
+                    employee=employee,
+                    date__gte=period_start,
+                    date__lte=period_end,
+                    status='approved'
+                )
+            }
+
+            attendances = Attendance.objects.filter(
+                employee=employee,
+                date__gte=period_start,
+                date__lte=period_end
+            )
+            att_map = {}
+            for att in attendances:
+                if att.date not in att_map:
+                    att_map[att.date] = []
+                att_map[att.date].append(att)
+
+            leaves = {
+                (l.start_time.date(), l.end_time.date())
+                for l in PaidLeave.objects.filter(
+                    employee=employee,
+                    approved=True,
+                    start_time__date__lte=period_end,
+                    end_time__date__gte=period_start
+                )
+            }
+
+            current = period_start
+            while current <= period_end:
+                is_off_day = (weekly_off is not None and current.weekday() == weekly_off)
+                is_holiday = current in holidays
+                is_on_leave = any(l_start <= current <= l_end for l_start, l_end in leaves)
+
+                daily_overtime_pay = 0.0
+                for (ot_date, ot_time), ot in overtimes.items():
+                    if ot_date == current:
+                        daily_overtime_pay += float(ot.total_hours) * hourly_rate
+
+                if current in att_map:
+                    day_atts = att_map[current]
+                    day_hours = sum(a.total_hours for a in day_atts)
+                    period_worked_hours += day_hours
+                    period_regular_pay += day_hours * hourly_rate
+                    period_present += 1
+                elif is_off_day:
+                    period_off_day_pay += shift_hours * hourly_rate
+                    period_worked_hours += shift_hours
+                elif is_holiday:
+                    period_holiday_pay += shift_hours * hourly_rate
+                elif is_on_leave:
+                    period_leave_pay += shift_hours * hourly_rate
+                else:
+                    period_absent += 1
+
+                if daily_overtime_pay > 0:
+                    period_overtime_pay += daily_overtime_pay
+
+                current += timedelta(days=1)
+
+            period_total = period_regular_pay + period_holiday_pay + period_leave_pay + period_off_day_pay + period_overtime_pay
+            total_payout += period_total
+            total_present_days += period_present
+            total_absent_days += period_absent
+            total_holiday_pay += period_holiday_pay
+            total_leave_pay += period_leave_pay
+            total_off_day_pay += period_off_day_pay
+            total_overtime_pay += period_overtime_pay
+
+            periods_data.append({
+                "shift_name": shift.name,
+                "from_date": str(period_start),
+                "to_date": str(period_end),
+                "days_in_period": period_days,
+                "weekly_off_days": weekly_off_count,
+                "working_days": working_days,
+                "expected_hours": round(expected_hours, 2),
+                "salary_portion": round(salary_portion, 2),
+                "hourly_rate": round(hourly_rate, 2),
+                "present_days": period_present,
+                "absent_days": period_absent,
+                "total_worked_hours": round(period_worked_hours, 2),
+                "regular_pay": round(period_regular_pay, 2),
+                "holiday_pay": round(period_holiday_pay, 2),
+                "leave_pay": round(period_leave_pay, 2),
+                "off_day_pay": round(period_off_day_pay, 2),
+                "overtime_pay": round(period_overtime_pay, 2),
+                "total_pay": round(period_total, 2),
+            })
 
         return Response({
             "employee_id": employee.emp_id,
             "employee_name": employee.name,
             "period": f"{start_date} to {end_date}",
-            "total_hours": format_hours_display(total_worked_hours),
-            "total_hours_value": total_worked_hours,
-            "hourly_rate": float(employee.hourly_rate or 0),
-            "total_payout": float(payout)
+            "salary": float(employee.salary or 0),
+            "shift_periods": periods_data,
+            "total_present_days": total_present_days,
+            "total_absent_days": total_absent_days,
+            "total_holiday_pay": round(total_holiday_pay, 2),
+            "total_leave_pay": round(total_leave_pay, 2),
+            "total_off_day_pay": round(total_off_day_pay, 2),
+            "total_overtime_pay": round(total_overtime_pay, 2),
+            "total_payout": round(total_payout, 2),
         })
 
     @action(detail=True, methods=['get'])
@@ -524,6 +719,78 @@ class EmployeeViewSet(viewsets.ModelViewSet):
 
         data = [{"emp_id": r.emp_id, "name": r.name} for r in relatives_qs.order_by('emp_id')]
         return Response({"relatives": data})
+
+    @action(detail=True, methods=['get', 'post'])
+    def assign_shift(self, request, emp_id=None):
+        """Get or assign a shift for an employee.
+
+        GET: returns current active shift assignment.
+        POST body: {"shift_id": <id>, "from_date": "YYYY-MM-DD"}
+        """
+        employee = self.get_object()
+
+        if request.method == 'GET':
+            active = employee.get_active_shift_entry()
+            if active:
+                serializer = EmployeeShiftHistorySerializer(active)
+                return Response(serializer.data)
+            return Response({"detail": "No active shift assignment found."})
+
+        shift_id = request.data.get('shift_id')
+        from_date_str = request.data.get('from_date')
+
+        if not shift_id or not from_date_str:
+            return Response(
+                {"error": "shift_id and from_date are required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            from_date = datetime.strptime(from_date_str, '%Y-%m-%d').date()
+        except ValueError:
+            return Response(
+                {"error": "Invalid from_date format. Use YYYY-MM-DD"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            shift = Shift.objects.get(id=shift_id)
+        except Shift.DoesNotExist:
+            return Response(
+                {"error": f"Shift with id {shift_id} not found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Close current active shift
+        current_active = employee.get_active_shift_entry()
+        if current_active:
+            current_active.close(from_date)
+
+        # Create new shift assignment
+        history_entry = EmployeeShiftHistory.objects.create(
+            employee=employee,
+            shift=shift,
+            from_date=from_date,
+            to_date=None,
+            salary=employee.salary,
+            shift_start_time=shift.start_time,
+            shift_end_time=shift.end_time,
+        )
+
+        # Update employee's current_shift
+        employee.current_shift = shift
+        employee.save(update_fields=['current_shift'])
+
+        serializer = EmployeeShiftHistorySerializer(history_entry)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['get'])
+    def shift_history(self, request, emp_id=None):
+        """Get all shift assignments for an employee."""
+        employee = self.get_object()
+        history = EmployeeShiftHistory.objects.filter(employee=employee).order_by('-from_date')
+        serializer = EmployeeShiftHistorySerializer(history, many=True)
+        return Response(serializer.data)
 
 
 @api_view(['GET'])
@@ -982,12 +1249,12 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             if employee.emp_id in present_employee_ids:
                 continue
 
-            if not employee.start_time or not employee.end_time:
+            s_start, s_end = get_employee_shift_times(employee, report_date)
+            if not s_start or not s_end:
                 pending_count += 1
                 continue
 
-            if report_date < today or (report_date == today and current_time >= employee.end_time):
-                # Check approved paid leaves covering this date
+            if report_date < today or (report_date == today and current_time >= s_end):
                 on_leave = PaidLeave.objects.filter(
                     employee=employee,
                     approved=True,
@@ -1161,25 +1428,23 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         for d_offset in range(delta + 1):
             rdate = start_date + timedelta(days=d_offset)
             for emp in employees:
-                # If no shift times, still create absent record (use midnight as check_in)
-                if not emp.start_time or not emp.end_time:
-                    # but if an attendance exists or leave exists skip
+                s_start, s_end = get_employee_shift_times(emp, rdate)
+                if not s_start or not s_end:
                     exists = Attendance.objects.filter(employee=emp).filter(
                         Q(date=rdate) | Q(check_in__date=rdate)
                     ).exists()
+                    if exists:
+                        skipped.append({"employee": emp.emp_id, "date": rdate.isoformat(), "reason": "has_attendance"})
+                        continue
                     on_leave = PaidLeave.objects.filter(
                         employee=emp,
                         approved=True,
                         start_time__date__lte=rdate,
                         end_time__date__gte=rdate,
                     ).exists()
-                    if exists:
-                        skipped.append({"employee": emp.emp_id, "date": rdate.isoformat(), "reason": "has_attendance"})
-                        continue
                     if on_leave:
                         skipped.append({"employee": emp.emp_id, "date": rdate.isoformat(), "reason": "on_leave"})
                         continue
-                    # create absent record with midnight check_in
                     check_dt = datetime.combine(rdate, time(0, 0))
                     att = Attendance.objects.create(
                         employee=emp,
@@ -1192,7 +1457,6 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                     created.append({"employee": emp.emp_id, "date": rdate.isoformat(), "id": att.id})
                     continue
 
-                # if attendance exists for this date (either stored date or check_in date), skip
                 exists = Attendance.objects.filter(employee=emp).filter(
                     Q(date=rdate) | Q(check_in__date=rdate)
                 ).exists()
@@ -1200,7 +1464,6 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                     skipped.append({"employee": emp.emp_id, "date": rdate.isoformat(), "reason": "has_attendance"})
                     continue
 
-                # if approved leave exists, skip
                 on_leave = PaidLeave.objects.filter(
                     employee=emp,
                     approved=True,
@@ -1211,8 +1474,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                     skipped.append({"employee": emp.emp_id, "date": rdate.isoformat(), "reason": "on_leave"})
                     continue
 
-                # create absent attendance record with zero duration (check_in==check_out at shift start)
-                check_dt = datetime.combine(rdate, emp.start_time)
+                check_dt = datetime.combine(rdate, s_start)
                 att = Attendance.objects.create(
                     employee=emp,
                     date=rdate,
@@ -1268,19 +1530,19 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         # on a previous date will be treated as the next action's check-out.
         last_att = Attendance.objects.filter(employee=employee).order_by('-check_in').first()
 
+        # Get today's shift times
+        s_start, s_end = get_employee_shift_times(employee, today)
+
         # If there's an open attendance (no check_out), treat this request as a check-out
         if last_att and last_att.check_out is None:
             duration = (now - last_att.check_in).total_seconds() / 3600
             if duration > 14:
                 # Auto-check-out at shift end and create a new attendance (check-in)
-                # Determine shift end datetime based on last_att.date and employee.end_time
-                if getattr(employee, 'end_time', None):
-                    shift_end_dt = datetime.combine(last_att.date, employee.end_time)
-                    # If overnight shift, end_time may be on next day
-                    if getattr(employee, 'start_time', None) and employee.end_time <= employee.start_time:
+                if s_end:
+                    shift_end_dt = datetime.combine(last_att.date, s_end)
+                    if s_start and s_end <= s_start:
                         shift_end_dt += timedelta(days=1)
                 else:
-                    # Fallback: cap at 14 hours after check_in
                     shift_end_dt = last_att.check_in + timedelta(hours=14)
 
                 # Ensure shift_end_dt is not in the future beyond 'now'
@@ -1298,13 +1560,11 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 last_att.message_late = (prev_msg + ' | ' + missing_note).strip(' |')
                 last_att.save()
 
-                # Create a new attendance record representing the new check-in (current scan)
                 new_status = 'on_time'
                 new_late_msg = None
-                if employee.start_time:
-                    # Determine lateness for the new check-in against today's shift start
-                    new_shift_start = datetime.combine(now.date(), employee.start_time)
-                    if getattr(employee, 'end_time', None) and employee.end_time <= employee.start_time and new_shift_start > now:
+                if s_start:
+                    new_shift_start = datetime.combine(now.date(), s_start)
+                    if s_end and s_end <= s_start and new_shift_start > now:
                         new_shift_start -= timedelta(days=1)
                     is_late_new = now > new_shift_start
                     new_status = 'late' if is_late_new else 'on_time'
@@ -1349,12 +1609,11 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_200_OK
             )
 
-        # Otherwise create a new check-in. Determine lateness and present minutes-based message.
         status_val = 'on_time'
         late_msg = None
-        if employee.start_time:
-            shift_start_dt = datetime.combine(today, employee.start_time)
-            if getattr(employee, 'end_time', None) and employee.end_time <= employee.start_time and shift_start_dt > now:
+        if s_start:
+            shift_start_dt = datetime.combine(today, s_start)
+            if s_end and s_end <= s_start and shift_start_dt > now:
                 shift_start_dt -= timedelta(days=1)
 
             is_late = now > shift_start_dt
@@ -1443,11 +1702,13 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         if last_attendance and last_attendance.check_out is None:
             first_checkin = last_attendance
 
+        s_start, s_end = get_employee_shift_times(employee, today)
+
         attendance_info = {
             "emp_id": employee.emp_id,
             "employee_name": employee.name,
             "profile_img": f"http://{settings.SERVER_IP}:{settings.SERVER_PORT}{employee.profile_img.url}" if employee.profile_img else None,
-            "shift_type": employee.shift_type,
+            "shift_type": employee.current_shift.name if employee.current_shift else "N/A",
             "timestamp": now.strftime('%I:%M %p'), 
         }
         
@@ -1455,14 +1716,11 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         did_modify = False
         if not last_attendance or (last_attendance.check_out is not None):
             # ===== NEW CHECK-IN =====
-            shift_start = employee.start_time
             is_late = False
             late_msg = "On time"
-            if shift_start:
-                shift_start_dt = datetime.combine(today, shift_start)
-                # Adjust for overnight shifts: if shift_end <= shift_start and shift_start is after now,
-                # the actual shift start was yesterday.
-                if getattr(employee, 'end_time', None) and employee.end_time <= shift_start and shift_start_dt > now:
+            if s_start:
+                shift_start_dt = datetime.combine(today, s_start)
+                if s_end and s_end <= s_start and shift_start_dt > now:
                     shift_start_dt -= timedelta(days=1)
 
                 is_late = now > shift_start_dt
@@ -1522,13 +1780,11 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 pass
 
             if duration > 14:
-                # Do NOT auto-fill previous record's check_out; leave it open.
-                # Create a new attendance record for the new check-in.
                 new_status = 'on_time'
                 new_late_msg = None
-                if employee.start_time:
-                    new_shift_start = datetime.combine(now.date(), employee.start_time)
-                    if getattr(employee, 'end_time', None) and employee.end_time <= employee.start_time and new_shift_start > now:
+                if s_start:
+                    new_shift_start = datetime.combine(now.date(), s_start)
+                    if s_end and s_end <= s_start and new_shift_start > now:
                         new_shift_start -= timedelta(days=1)
                     is_late_new = now > new_shift_start
                     new_status = 'late' if is_late_new else 'on_time'
@@ -1663,3 +1919,40 @@ class ShiftViewSet(viewsets.ModelViewSet):
     queryset = Shift.objects.all()
     serializer_class = ShiftSerializer
     permission_classes = [IsAuthenticated]
+
+
+class HolidayViewSet(viewsets.ModelViewSet):
+    queryset = Holiday.objects.all().order_by('date')
+    serializer_class = HolidaySerializer
+    permission_classes = [IsAuthenticated]
+
+
+class OvertimeViewSet(viewsets.ModelViewSet):
+    queryset = Overtime.objects.all().order_by('-date', '-start_time')
+    serializer_class = OvertimeSerializer
+    permission_classes = [IsAuthenticated]
+
+    def perform_create(self, serializer):
+        serializer.save()
+
+    @action(detail=True, methods=['post'])
+    def approve(self, request, pk=None):
+        """Approve an overtime request."""
+        ot = self.get_object()
+        if ot.status != 'pending':
+            return Response({"error": "Overtime is not in pending status."}, status=status.HTTP_400_BAD_REQUEST)
+        ot.status = 'approved'
+        ot.approved_by = request.user if request.user.is_authenticated else None
+        ot.save()
+        return Response(OvertimeSerializer(ot).data)
+
+    @action(detail=True, methods=['post'])
+    def reject(self, request, pk=None):
+        """Reject an overtime request."""
+        ot = self.get_object()
+        if ot.status != 'pending':
+            return Response({"error": "Overtime is not in pending status."}, status=status.HTTP_400_BAD_REQUEST)
+        ot.status = 'rejected'
+        ot.approved_by = request.user if request.user.is_authenticated else None
+        ot.save()
+        return Response(OvertimeSerializer(ot).data)
