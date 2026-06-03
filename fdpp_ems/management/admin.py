@@ -102,4 +102,3 @@ class PaidLeaveAdmin(admin.ModelAdmin):
 class ShiftAdmin(admin.ModelAdmin):
     list_display = ['name', 'start_time', 'end_time']
     search_fields = ['name']
-
