@@ -5,7 +5,7 @@ from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.decorators import api_view, permission_classes
 from django_filters import rest_framework as filters
 from django.contrib.auth.models import User
-from .models import Employee, Attendance, PaidLeave, Shift, UserAccessLevel, InactiveAttendanceAttempt, EmployeeShiftHistory, Holiday, Overtime
+from .models import Employee, Attendance, PaidLeave, Shift, UserAccessLevel, InactiveAttendanceAttempt, EmployeeShiftHistory, Holiday, Overtime, get_employee_shift_times, get_overtime_max_allowed
 from .serializers import (
     EmployeeSerializer, AttendanceSerializer, PaidLeaveSerializer, 
     ShiftSerializer, UserSerializer, UserAccessLevelSerializer,
@@ -45,22 +45,6 @@ def format_hours_display(hours_value):
     return f'{hours}h {minutes}m'
 
 
-def get_employee_shift_times(employee, target_date=None):
-    """Get shift start/end times for an employee, using EmployeeShiftHistory.
-
-    Returns (start_time, end_time) or (None, None) if no shift found.
-    """
-    if target_date:
-        entry = employee.get_shift_for_date(target_date)
-    else:
-        entry = employee.get_active_shift_entry()
-
-    if entry and entry.shift:
-        return (entry.shift_start_time or entry.shift.start_time,
-                entry.shift_end_time or entry.shift.end_time)
-    if employee.current_shift:
-        return (employee.current_shift.start_time, employee.current_shift.end_time)
-    return (None, None)
 
 
 def build_absent_entries(report_date, request=None):
@@ -367,7 +351,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             employee=employee,
             from_date__lte=end_date
         ).filter(
-            models.Q(to_date__isnull=True) | models.Q(to_date__gte=start_date)
+            Q(to_date__isnull=True) | Q(to_date__gte=start_date)
         ).order_by('from_date')
 
         total_payout = 0.0
@@ -393,6 +377,8 @@ class EmployeeViewSet(viewsets.ModelViewSet):
 
             shift_start_time = entry.shift_start_time or shift.start_time
             shift_end_time = entry.shift_end_time or shift.end_time
+            if not shift_start_time or not shift_end_time:
+                continue
             shift_seconds = (datetime.combine(date.today(), shift_end_time) -
                              datetime.combine(date.today(), shift_start_time)).total_seconds()
             if shift_seconds <= 0:
@@ -1536,14 +1522,15 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         # If there's an open attendance (no check_out), treat this request as a check-out
         if last_att and last_att.check_out is None:
             duration = (now - last_att.check_in).total_seconds() / 3600
-            if duration > 14:
+            max_allowed = get_overtime_max_allowed(employee, last_att.check_in)
+            if duration > max_allowed:
                 # Auto-check-out at shift end and create a new attendance (check-in)
                 if s_end:
                     shift_end_dt = datetime.combine(last_att.date, s_end)
                     if s_start and s_end <= s_start:
                         shift_end_dt += timedelta(days=1)
                 else:
-                    shift_end_dt = last_att.check_in + timedelta(hours=14)
+                    shift_end_dt = last_att.check_in + timedelta(hours=max_allowed)
 
                 # Ensure shift_end_dt is not in the future beyond 'now'
                 if shift_end_dt > now:
@@ -1580,7 +1567,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                     message_late=new_late_msg
                 )
 
-                total_hours_prev = round(min((last_att.check_out - last_att.check_in).total_seconds() / 3600, 14.0), 2)
+                total_hours_prev = round(min((last_att.check_out - last_att.check_in).total_seconds() / 3600, max_allowed), 2)
 
                 return Response(
                     {
@@ -1593,11 +1580,11 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_200_OK
                 )
 
-            # Normal check-out within 14 hours
+            # Normal check-out within max_allowed hours
             last_att.check_out = now
             last_att.save()
 
-            total_hours = round(min((now - last_att.check_in).total_seconds() / 3600, 14.0), 2)
+            total_hours = round(min((now - last_att.check_in).total_seconds() / 3600, max_allowed), 2)
 
             return Response(
                 {
@@ -1778,8 +1765,9 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 logger.debug(f"Computed duration_hours={duration}")
             except Exception:
                 pass
+            max_allowed = get_overtime_max_allowed(employee, last_attendance.check_in)
 
-            if duration > 14:
+            if duration > max_allowed:
                 new_status = 'on_time'
                 new_late_msg = None
                 if s_start:
@@ -1828,7 +1816,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 total_hours = 0
                 if first_checkin:
                     total_duration = (now - first_checkin.check_in).total_seconds() / 3600
-                    total_hours = round(min(total_duration, 14.0), 2)
+                    total_hours = round(min(total_duration, max_allowed), 2)
 
                 action = "check_out"
                 message = "Check-out successful"
@@ -1931,6 +1919,8 @@ class OvertimeViewSet(viewsets.ModelViewSet):
     queryset = Overtime.objects.all().order_by('-date', '-start_time')
     serializer_class = OvertimeSerializer
     permission_classes = [IsAuthenticated]
+    filter_backends = (filters.DjangoFilterBackend,)
+    filterset_fields = ['date', 'employee', 'status']
 
     def perform_create(self, serializer):
         serializer.save()

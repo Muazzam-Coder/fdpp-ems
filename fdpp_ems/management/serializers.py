@@ -1,6 +1,6 @@
 from rest_framework import serializers
 from django.contrib.auth.models import User
-from .models import Employee, Attendance, PaidLeave, Shift, UserAccessLevel, EmployeeShiftHistory, Holiday, Overtime
+from .models import Employee, Attendance, PaidLeave, Shift, UserAccessLevel, EmployeeShiftHistory, Holiday, Overtime, get_overtime_max_allowed
 from django.utils import timezone
 from datetime import datetime
 
@@ -329,10 +329,18 @@ class AttendanceSerializer(serializers.ModelSerializer):
             temp_check_in = datetime.combine(temp_date, check_in_time)
             temp_check_out = datetime.combine(temp_date, check_out_time)
 
-            duration = temp_check_out - temp_check_in
-            if duration.total_seconds() > 14 * 3600:
+            duration_hours = (temp_check_out - temp_check_in).total_seconds() / 3600
+            max_allowed = 14.0
+            employee_id = data.get('employee')
+            if employee_id:
+                try:
+                    emp = Employee.objects.get(pk=employee_id)
+                    max_allowed = get_overtime_max_allowed(emp, temp_check_in)
+                except Employee.DoesNotExist:
+                    pass
+            if duration_hours > max_allowed:
                 raise serializers.ValidationError(
-                    "Work duration cannot exceed 14 hours per shift."
+                    f"Work duration cannot exceed {max_allowed:.0f} hours per shift."
                 )
         return data
 
@@ -401,3 +409,35 @@ class OvertimeSerializer(serializers.ModelSerializer):
             'status', 'note', 'created_at', 'updated_at'
         ]
         read_only_fields = ['created_at', 'updated_at', 'approved_by', 'status']
+
+    def validate(self, data):
+        employee = data.get('employee')
+        date = data.get('date')
+        start_time = data.get('start_time')
+        end_time = data.get('end_time')
+
+        if employee and date and start_time and end_time:
+            if end_time <= start_time:
+                raise serializers.ValidationError("End time must be after start time.")
+
+            is_holiday = Holiday.objects.filter(date=date).exists()
+            is_off_day = (employee.weekly_off_day is not None and
+                          date.weekday() == employee.weekly_off_day)
+
+            if not is_holiday and not is_off_day:
+                from .models import get_employee_shift_times
+                s_start, s_end = get_employee_shift_times(employee, date)
+
+                if s_start and s_end:
+                    def shift_contains(t):
+                        if s_start <= s_end:
+                            return s_start <= t <= s_end
+                        else:
+                            return t >= s_start or t <= s_end
+
+                    if shift_contains(start_time) or shift_contains(end_time):
+                        raise serializers.ValidationError(
+                            "Overtime must start after shift end time."
+                        )
+
+        return data

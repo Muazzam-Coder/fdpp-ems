@@ -238,6 +238,55 @@ class Overtime(models.Model):
         return round(min(duration, 14.0), 2)
 
 
+def get_employee_shift_times(employee, target_date=None):
+    """Get shift start/end times for an employee, using EmployeeShiftHistory.
+    Returns (start_time, end_time) or (None, None) if no shift found.
+    """
+    if target_date:
+        entry = employee.get_shift_for_date(target_date)
+    else:
+        entry = employee.get_active_shift_entry()
+    if entry and entry.shift:
+        return (entry.shift_start_time or entry.shift.start_time,
+                entry.shift_end_time or entry.shift.end_time)
+    if employee.current_shift:
+        return (employee.current_shift.start_time, employee.current_shift.end_time)
+    return (None, None)
+
+
+def get_approved_overtime_for_date(employee, target_date):
+    """Returns the first approved Overtime record for an employee on a date, or None."""
+    return Overtime.objects.filter(
+        employee=employee, date=target_date, status='approved'
+    ).first()
+
+
+def get_overtime_max_allowed(employee, check_in_dt):
+    """Calculate overtime-adjusted max hours for an attendance record.
+    
+    If approved overtime exists for the attendance date, returns the max of
+    14 hours and the hours from check_in to overtime end.
+    Otherwise returns 14.0.
+    """
+    target_date = check_in_dt.date()
+    ot = get_approved_overtime_for_date(employee, target_date)
+    if ot:
+        ot_end = datetime.combine(target_date, ot.end_time)
+        if ot.end_time <= ot.start_time:
+            ot_end += timedelta(days=1)
+        ot_allowed = (ot_end - check_in_dt).total_seconds() / 3600
+        return max(14.0, ot_allowed)
+    return 14.0
+
+
+def get_approved_overtime_hours_for_date(employee, target_date):
+    """Get total overtime hours for an employee on a date (approved only)."""
+    ot = get_approved_overtime_for_date(employee, target_date)
+    if ot:
+        return float(ot.total_hours)
+    return 0.0
+
+
 class InactiveAttendanceAttempt(models.Model):
     employee = models.ForeignKey(
         Employee,
@@ -315,12 +364,13 @@ class Attendance(models.Model):
         if self.check_in and self.check_out:
             duration = self.check_out - self.check_in
             hours = duration.total_seconds() / 3600
-            return round(min(hours, 14.0), 2)
+            max_allowed = get_overtime_max_allowed(self.employee, self.check_in)
+            return round(min(hours, max_allowed), 2)
         return 0
 
     @property
     def overtime_hours(self):
-        return 0.0
+        return get_approved_overtime_hours_for_date(self.employee, self.date)
 
     @property
     def is_late(self):
