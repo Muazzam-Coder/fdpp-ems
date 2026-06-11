@@ -429,13 +429,19 @@ class OvertimeSerializer(serializers.ModelSerializer):
                 s_start, s_end = get_employee_shift_times(employee, date)
 
                 if s_start and s_end:
-                    def shift_contains(t):
-                        if s_start <= s_end:
-                            return s_start <= t <= s_end
-                        else:
-                            return t >= s_start or t <= s_end
+                    from datetime import timedelta
 
-                    if shift_contains(start_time) or shift_contains(end_time):
+                    shift_start_dt = datetime.combine(date, s_start)
+                    shift_end_dt = datetime.combine(date, s_end)
+                    if shift_end_dt <= shift_start_dt:
+                        shift_end_dt += timedelta(days=1)
+
+                    ot_start_dt = datetime.combine(date, start_time)
+                    ot_end_dt = datetime.combine(date, end_time)
+                    if ot_end_dt <= ot_start_dt:
+                        ot_end_dt += timedelta(days=1)
+
+                    if ot_start_dt < shift_end_dt and ot_end_dt > shift_start_dt:
                         raise serializers.ValidationError(
                             "Overtime must start after shift end time."
                         )
