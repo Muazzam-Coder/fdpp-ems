@@ -1,4 +1,6 @@
 from rest_framework import viewsets, status
+from rest_framework.views import APIView
+from rest_framework.renderers import BaseRenderer, JSONRenderer
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
@@ -11,6 +13,7 @@ from .serializers import (
     ShiftSerializer, UserSerializer, UserAccessLevelSerializer,
     CreateAdminManagerSerializer, RegisterSerializer,
     EmployeeShiftHistorySerializer, HolidaySerializer, OvertimeSerializer,
+    ComprehensiveReportInputSerializer,
 )
 from django.db.models import Sum, Count, Q, Avg
 from datetime import datetime, timedelta, date, time
@@ -1935,6 +1938,469 @@ class OvertimeViewSet(viewsets.ModelViewSet):
         ot.approved_by = request.user if request.user.is_authenticated else None
         ot.save()
         return Response(OvertimeSerializer(ot).data)
+
+
+WEEKDAY_NAMES = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+MONTH_DAYS = 30
+
+
+def _prorate_salary(salary_value, period_days):
+    if not salary_value:
+        return 0.0
+    return float(salary_value) * period_days / MONTH_DAYS
+
+
+def _build_excel_response(output_data, start_date, end_date):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Comprehensive Report"
+
+    header_font = openpyxl.styles.Font(bold=True)
+    summary_font = openpyxl.styles.Font(bold=True, color="003366")
+    currency_fmt = '#,##0.00'
+
+    employees = output_data['employees']
+    matrix = output_data['matrix']
+    summary = output_data['summary']
+    emp_ids = [str(e['emp_id']) for e in employees]
+
+    headers = ['Date', 'Weekday']
+    for emp in employees:
+        headers.append(f"{emp['name']} (In - Out)")
+    ws.append(headers)
+    for c in range(1, len(headers) + 1):
+        ws.cell(row=1, column=c).font = header_font
+
+    for row in matrix:
+        d = row['date']
+        date_str = d.strftime('%Y-%m-%d')
+        row_data = [date_str, row['weekday']]
+        for emp_id_str in emp_ids:
+            cell = row['cells'].get(emp_id_str, {})
+            status_val = cell.get('status', '')
+            if status_val == 'absent':
+                row_data.append('Absent')
+            elif status_val == 'leave':
+                lt = cell.get('leave_type', '')
+                row_data.append(f"Leave ({lt})" if lt else "Leave")
+            elif status_val == 'holiday':
+                hn = cell.get('holiday_name', '')
+                row_data.append(f"Holiday: {hn}" if hn else "Holiday")
+            elif status_val == 'off_day':
+                row_data.append('Off Day')
+            elif cell.get('in_time') and cell.get('out_time'):
+                in_str = cell['in_time'].strftime('%H:%M') if cell['in_time'] else '--:--'
+                out_str = cell['out_time'].strftime('%H:%M') if cell['out_time'] else '--:--'
+                val = f"{in_str} - {out_str}"
+                ot_h = cell.get('overtime_hours', 0)
+                if ot_h and float(ot_h) > 0:
+                    val += f" (OT:{ot_h}h)"
+                row_data.append(val)
+            else:
+                row_data.append('--:-- - --:--')
+        ws.append(row_data)
+
+    summary_start = len(matrix) + 3
+    ws.cell(row=summary_start, column=1, value='METRIC').font = summary_font
+    for idx, emp in enumerate(employees):
+        col = 2 + idx * 2
+        ws.cell(row=summary_start, column=col, value=emp['name']).font = summary_font
+        ws.merge_cells(start_row=summary_start, start_column=col, end_row=summary_start, end_column=col + 1)
+
+    summary_rows_data = [
+        ('Total Hours', 'total_hours', None),
+        ('Total Overtime', 'total_overtime_hours', None),
+        ('Days Present', 'days_present', 'int'),
+        ('Days Absent', 'days_absent', 'int'),
+        ('Days Leave', 'days_leave', 'int'),
+        ('Weekly Off Days', 'weekly_off_days', 'int'),
+        ('Holiday Days', 'holiday_days', 'int'),
+        ('Regular Pay', 'regular_pay', 'currency'),
+        ('Overtime Pay', 'overtime_pay', 'currency'),
+        ('Holiday Pay', 'holiday_pay', 'currency'),
+        ('Leave Pay', 'leave_pay', 'currency'),
+        ('Off Day Pay', 'off_day_pay', 'currency'),
+        ('Total Salary', 'total_salary', 'currency'),
+    ]
+
+    for r_idx, (label, field, fmt_type) in enumerate(summary_rows_data):
+        row_num = summary_start + 1 + r_idx
+        ws.cell(row=row_num, column=1, value=label)
+        if label == 'Total Salary':
+            ws.cell(row=row_num, column=1).font = summary_font
+        for e_idx, emp_id_str in enumerate(emp_ids):
+            emp_summary = summary.get(emp_id_str, {})
+            value = emp_summary.get(field, 0)
+            col = 2 + e_idx * 2
+            cell = ws.cell(row=row_num, column=col, value=value)
+            if fmt_type == 'currency':
+                cell.number_format = currency_fmt
+            ws.merge_cells(start_row=row_num, start_column=col, end_row=row_num, end_column=col + 1)
+
+    gt_row = summary_start + 1 + len(summary_rows_data) + 1
+    gt = output_data['grand_totals']
+    ws.cell(row=gt_row, column=1, value='GRAND TOTALS').font = summary_font
+    gt_fields = [('Total Hours', 'total_hours'), ('Total OT', 'total_overtime_hours'), ('Total Salary', 'total_salary')]
+    for e_idx, emp_id_str in enumerate(emp_ids):
+        col = 2 + e_idx * 2
+        ws.cell(row=gt_row, column=col, value='').font = summary_font
+        ws.merge_cells(start_row=gt_row, start_column=col, end_row=gt_row, end_column=col + 1)
+    for gt_idx, (gt_label, gt_field) in enumerate(gt_fields):
+        r = gt_row + 1 + gt_idx
+        ws.cell(row=r, column=1, value=gt_label).font = summary_font
+        for e_idx, emp_id_str in enumerate(emp_ids):
+            col = 2 + e_idx * 2
+            ws.cell(row=r, column=col, value=gt[gt_field]).font = summary_font
+            ws.merge_cells(start_row=r, start_column=col, end_row=r, end_column=col + 1)
+
+    ws.column_dimensions['A'].width = 14
+    ws.column_dimensions['B'].width = 10
+    for i in range(len(employees)):
+        col_letter = get_column_letter(3 + i)
+        ws.column_dimensions[col_letter].width = 28
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+
+    filename = f"comprehensive_report_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
+    resp = HttpResponse(
+        output.getvalue(),
+        content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    )
+    resp['Content-Disposition'] = f'attachment; filename="{filename}"'
+    return resp
+
+
+class ExcelRenderer(BaseRenderer):
+    media_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    format = 'excel'
+    charset = None
+
+    def render(self, data, media_type=None, renderer_context=None):
+        return data
+
+
+class ComprehensiveReportView(APIView):
+    permission_classes = [IsAuthenticated]
+    renderer_classes = [JSONRenderer, ExcelRenderer]
+
+    def get(self, request):
+        return self._handle(request)
+
+    def post(self, request):
+        return self._handle(request)
+
+    def _handle(self, request):
+        data = {}
+        if request.method == 'GET':
+            data = request.query_params.dict()
+            emp_param = request.query_params.getlist('employee_ids')
+            if emp_param:
+                ids = []
+                for part in emp_param:
+                    for x in part.split(','):
+                        x = x.strip()
+                        if x:
+                            try:
+                                ids.append(int(x))
+                            except ValueError:
+                                pass
+                if ids:
+                    data['employee_ids'] = ids
+        else:
+            data = request.data
+
+        serializer = ComprehensiveReportInputSerializer(data=data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        start_date = serializer.validated_data['start_date']
+        end_date = serializer.validated_data['end_date']
+        fmt = serializer.validated_data.get('format', 'json')
+        emp_ids = serializer.validated_data.get('employee_ids', None)
+
+        employees_qs = Employee.objects.filter(status='active').select_related('current_shift').order_by('emp_id')
+        if emp_ids:
+            employees_qs = employees_qs.filter(emp_id__in=emp_ids)
+
+        if not employees_qs.exists():
+            return Response({"error": "No active employees found"}, status=status.HTTP_404_NOT_FOUND)
+
+        attendances = Attendance.objects.filter(
+            date__range=[start_date, end_date], employee__in=employees_qs
+        ).select_related('employee')
+
+        overtimes = Overtime.objects.filter(
+            date__range=[start_date, end_date], employee__in=employees_qs, status='approved'
+        ).select_related('employee')
+
+        leaves = PaidLeave.objects.filter(
+            start_time__date__lte=end_date, end_time__date__gte=start_date,
+            employee__in=employees_qs, approved=True
+        ).select_related('employee')
+
+        holidays = Holiday.objects.filter(date__range=[start_date, end_date])
+        holidays_by_date = {h.date: h for h in holidays}
+
+        shift_history = EmployeeShiftHistory.objects.filter(
+            employee__in=employees_qs, from_date__lte=end_date
+        ).filter(
+            Q(to_date__isnull=True) | Q(to_date__gte=start_date)
+        ).select_related('shift', 'employee').order_by('employee', 'from_date')
+
+        att_map = {}
+        for a in attendances:
+            att_map.setdefault(a.employee.emp_id, {})[a.date] = a
+
+        ot_map = {}
+        for o in overtimes:
+            ot_map.setdefault(o.employee.emp_id, {})[o.date] = o
+
+        leaves_map = {}
+        for lv in leaves:
+            leaves_map.setdefault(lv.employee.emp_id, {}).setdefault(lv.start_time.date(), []).append(lv)
+
+        sh_map = {}
+        for sh in shift_history:
+            sh_map.setdefault(sh.employee.emp_id, []).append(sh)
+
+        employee_info_list = []
+        for emp in employees_qs:
+            employee_info_list.append({
+                'emp_id': emp.emp_id,
+                'name': emp.name,
+                'designation': emp.designation,
+                'current_shift': {
+                    'id': emp.current_shift.id,
+                    'name': emp.current_shift.name,
+                    'start_time': emp.current_shift.start_time,
+                    'end_time': emp.current_shift.end_time,
+                } if emp.current_shift else None,
+                'weekly_off_day': emp.weekly_off_day,
+                'salary': emp.salary,
+                'hourly_rate': emp.hourly_rate,
+            })
+
+        matrix = []
+        emp_id_list = [e.emp_id for e in employees_qs]
+        current_date = start_date
+        today = timezone.now().date()
+
+        while current_date <= end_date:
+            weekday = WEEKDAY_NAMES[current_date.weekday()]
+            holiday = holidays_by_date.get(current_date)
+            is_holiday = holiday is not None
+            cells = {}
+
+            for emp in employees_qs:
+                emp_id = emp.emp_id
+                weekly_off = emp.weekly_off_day
+                is_off = weekly_off is not None and current_date.weekday() == weekly_off
+
+                att = att_map.get(emp_id, {}).get(current_date)
+                ot_rec = ot_map.get(emp_id, {}).get(current_date)
+                lv_records = leaves_map.get(emp_id, {}).get(current_date, [])
+
+                leave_type = None
+                on_leave = False
+                for lv in lv_records:
+                    lv_start = lv.start_time.date()
+                    lv_end = lv.end_time.date()
+                    if lv_start <= current_date <= lv_end:
+                        on_leave = True
+                        leave_type = lv.leave_type
+                        break
+
+                in_time = None
+                out_time = None
+                status_val = 'absent'
+                ot_hours = 0.0
+
+                if on_leave:
+                    status_val = 'leave'
+                elif is_holiday:
+                    status_val = 'holiday'
+                elif is_off:
+                    status_val = 'off_day'
+                elif att:
+                    in_time = att.check_in.time() if att.check_in else None
+                    out_time = att.check_out.time() if att.check_out else None
+                    status_val = att.status
+                else:
+                    status_val = 'absent' if current_date < today else 'absent'
+
+                if ot_rec:
+                    ot_hours = float(ot_rec.total_hours)
+
+                cells[str(emp_id)] = {
+                    'in_time': in_time,
+                    'out_time': out_time,
+                    'status': status_val,
+                    'overtime_hours': round(ot_hours, 2),
+                    'leave': on_leave,
+                    'leave_type': leave_type,
+                    'absent': status_val == 'absent',
+                    'off_day': is_off,
+                    'holiday_name': holiday.name if holiday else None,
+                }
+
+            matrix.append({
+                'date': current_date,
+                'weekday': weekday,
+                'is_holiday': is_holiday,
+                'is_off_day': False,
+                'cells': cells,
+            })
+
+            current_date += timedelta(days=1)
+
+        summary = {}
+        grand_hours = 0
+        grand_ot_hours = 0
+        grand_salary = 0
+
+        for emp in employees_qs:
+            emp_id = emp.emp_id
+            total_hours = 0.0
+            total_ot_hours = 0.0
+            days_present = 0
+            days_absent = 0
+            days_leave = 0
+            weekly_off_count = 0
+            holiday_count = 0
+            regular_pay = 0.0
+            overtime_pay = 0.0
+            holiday_pay = 0.0
+            leave_pay = 0.0
+            off_day_pay = 0.0
+
+            emp_sh = sh_map.get(emp_id, [])
+
+            date_shift_info = {}
+            for row in matrix:
+                d = row['date']
+                cell = row['cells'].get(str(emp_id), {})
+                if not cell:
+                    continue
+
+                applicable_sh = None
+                for sh_entry in emp_sh:
+                    sh_from = sh_entry.from_date
+                    sh_to = sh_entry.to_date if sh_entry.to_date else end_date
+                    if sh_from <= d <= sh_to:
+                        applicable_sh = sh_entry
+                        break
+
+                if not applicable_sh:
+                    continue
+
+                shift = applicable_sh.shift
+                if not shift:
+                    continue
+                s_start = applicable_sh.shift_start_time or shift.start_time
+                s_end = applicable_sh.shift_end_time or shift.end_time
+                if not s_start or not s_end:
+                    continue
+
+                s_seconds = (datetime.combine(date.today(), s_end) -
+                             datetime.combine(date.today(), s_start)).total_seconds()
+                if s_seconds <= 0:
+                    s_seconds += 86400
+                shift_hours = s_seconds / 3600
+                salary_value = applicable_sh.salary or emp.salary or 0
+                hourly_rate_val = _prorate_salary(salary_value, 1) / shift_hours if shift_hours > 0 else 0
+
+                date_shift_info[d] = {
+                    'shift_hours': shift_hours,
+                    'salary_value': float(salary_value),
+                    'hourly_rate': hourly_rate_val,
+                }
+
+            for row in matrix:
+                d = row['date']
+                cell = row['cells'].get(str(emp_id), {})
+                if not cell:
+                    continue
+
+                si = date_shift_info.get(d)
+                if not si:
+                    continue
+
+                sh = si['shift_hours']
+                hr = si['hourly_rate']
+                st = cell.get('status')
+                ot_h = float(cell.get('overtime_hours', 0) or 0)
+
+                if st == 'on_time' or st == 'late':
+                    att = att_map.get(emp_id, {}).get(d)
+                    day_hours = float(att.total_hours) if att else sh
+                    total_hours += day_hours
+                    days_present += 1
+                    regular_pay += day_hours * hr
+                elif st == 'absent':
+                    days_absent += 1
+                elif st == 'leave':
+                    days_leave += 1
+                    total_hours += sh
+                    leave_pay += sh * hr
+                elif st == 'holiday':
+                    holiday_count += 1
+                    total_hours += sh
+                    holiday_pay += sh * hr
+                elif st == 'off_day':
+                    weekly_off_count += 1
+                    total_hours += sh
+                    off_day_pay += sh * hr
+
+                if ot_h > 0:
+                    total_ot_hours += ot_h
+                    overtime_pay += ot_h * hr * 1.5
+
+            total_salary = regular_pay + overtime_pay + holiday_pay + leave_pay + off_day_pay
+
+            summary[str(emp_id)] = {
+                'emp_id': emp_id,
+                'name': emp.name,
+                'total_hours': round(total_hours, 2),
+                'total_overtime_hours': round(total_ot_hours, 2),
+                'days_present': days_present,
+                'days_absent': days_absent,
+                'days_leave': days_leave,
+                'weekly_off_days': weekly_off_count,
+                'holiday_days': holiday_count,
+                'regular_pay': round(regular_pay, 2),
+                'overtime_pay': round(overtime_pay, 2),
+                'holiday_pay': round(holiday_pay, 2),
+                'leave_pay': round(leave_pay, 2),
+                'off_day_pay': round(off_day_pay, 2),
+                'total_salary': round(total_salary, 2),
+            }
+
+            grand_hours += total_hours
+            grand_ot_hours += total_ot_hours
+            grand_salary += total_salary
+
+        grand_totals = {
+            'total_employees': employees_qs.count(),
+            'total_hours': round(grand_hours, 2),
+            'total_overtime_hours': round(grand_ot_hours, 2),
+            'total_salary': round(grand_salary, 2),
+        }
+
+        output_data = {
+            'date_range': {'start': start_date, 'end': end_date},
+            'generated_at': timezone.now(),
+            'employees': employee_info_list,
+            'matrix': matrix,
+            'summary': summary,
+            'grand_totals': grand_totals,
+        }
+
+        if fmt == 'excel':
+            return _build_excel_response(output_data, start_date, end_date)
+
+        return Response(output_data)
 
     @action(detail=True, methods=['post'])
     def reject(self, request, pk=None):

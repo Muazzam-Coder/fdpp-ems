@@ -447,3 +447,25 @@ class OvertimeSerializer(serializers.ModelSerializer):
                         )
 
         return data
+
+
+class ComprehensiveReportInputSerializer(serializers.Serializer):
+    start_date = serializers.DateField(required=True)
+    end_date = serializers.DateField(required=True)
+    employee_ids = serializers.ListField(
+        child=serializers.IntegerField(),
+        required=False,
+        allow_empty=True,
+    )
+    format = serializers.ChoiceField(
+        choices=[('json', 'json'), ('excel', 'excel')],
+        default='json',
+        required=False,
+    )
+
+    def validate(self, data):
+        if data['start_date'] > data['end_date']:
+            raise serializers.ValidationError("start_date must be before or equal to end_date")
+        if (data['end_date'] - data['start_date']).days > 90:
+            raise serializers.ValidationError("Date range cannot exceed 90 days")
+        return data

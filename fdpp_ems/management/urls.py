@@ -2,7 +2,8 @@ from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import (
     EmployeeViewSet, AttendanceViewSet, PaidLeaveViewSet, ShiftViewSet, 
-    AuthViewSet, UserAccessLevelViewSet, HolidayViewSet, OvertimeViewSet
+    AuthViewSet, UserAccessLevelViewSet, HolidayViewSet, OvertimeViewSet,
+    ComprehensiveReportView,
 )
 from .views import employee_list
 
@@ -19,5 +20,6 @@ router.register(r'access-levels', UserAccessLevelViewSet, basename='access-level
 
 urlpatterns = [
     path('employee_list/', employee_list, name='employee_list'),
+    path('reports/comprehensive/', ComprehensiveReportView.as_view(), name='comprehensive_report'),
     path('', include(router.urls)),
 ]
