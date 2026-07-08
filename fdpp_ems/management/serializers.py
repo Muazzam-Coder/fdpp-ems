@@ -287,8 +287,8 @@ class AttendanceSerializer(serializers.ModelSerializer):
     total_hours_value = serializers.SerializerMethodField()
     is_late = serializers.ReadOnlyField()
     employee_name = serializers.CharField(source='employee.name', read_only=True)
-    check_in_time = serializers.TimeField(write_only=True, format='%H:%M:%S')
-    check_out_time = serializers.TimeField(write_only=True, format='%H:%M:%S', required=False, allow_null=True)
+    check_in_time = serializers.TimeField(write_only=True, format='%I:%M:%S %p')
+    check_out_time = serializers.TimeField(write_only=True, format='%I:%M:%S %p', required=False, allow_null=True)
     check_in = serializers.SerializerMethodField(read_only=True)
     check_out = serializers.SerializerMethodField(read_only=True)
 
@@ -309,12 +309,12 @@ class AttendanceSerializer(serializers.ModelSerializer):
 
     def get_check_in(self, obj):
         if obj.check_in:
-            return obj.check_in.strftime('%H:%M:%S')
+            return obj.check_in.strftime('%I:%M:%S %p')
         return None
 
     def get_check_out(self, obj):
         if obj.check_out:
-            return obj.check_out.strftime('%H:%M:%S')
+            return obj.check_out.strftime('%I:%M:%S %p')
         return None
 
     def validate(self, data):
@@ -334,7 +334,7 @@ class AttendanceSerializer(serializers.ModelSerializer):
             employee_id = data.get('employee')
             if employee_id:
                 try:
-                    emp = Employee.objects.get(pk=employee_id)
+                    emp = Employee.objects.get(emp_id=employee_id)
                     max_allowed = get_overtime_max_allowed(emp, temp_check_in)
                 except Employee.DoesNotExist:
                     pass
@@ -373,6 +373,7 @@ class AttendanceSerializer(serializers.ModelSerializer):
 class PaidLeaveSerializer(serializers.ModelSerializer):
     employee_name = serializers.CharField(source='employee.name', read_only=True)
     duration_days = serializers.ReadOnlyField()
+    employee = serializers.SlugRelatedField(slug_field='emp_id', queryset=Employee.objects.all())
 
     class Meta:
         model = PaidLeave
@@ -399,6 +400,7 @@ class OvertimeSerializer(serializers.ModelSerializer):
     employee_name = serializers.CharField(source='employee.name', read_only=True)
     total_hours = serializers.ReadOnlyField()
     approved_by_name = serializers.CharField(source='approved_by.username', read_only=True, allow_null=True)
+    employee = serializers.SlugRelatedField(slug_field='emp_id', queryset=Employee.objects.all())
 
     class Meta:
         model = Overtime

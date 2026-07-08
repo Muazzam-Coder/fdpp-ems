@@ -5,6 +5,7 @@ from django.utils import timezone
 from django.db.models.signals import pre_save, post_save
 from django.dispatch import receiver
 from datetime import timedelta, datetime, time
+from django.conf import settings
 from decimal import Decimal
 
 def get_current_date():
@@ -64,7 +65,37 @@ class Shift(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
-        return f"{self.name} ({self.start_time.strftime('%H:%M')} - {self.end_time.strftime('%H:%M')})"
+        return f"{self.name} ({self.start_time.strftime('%I:%M %p')} - {self.end_time.strftime('%I:%M %p')})"
+
+    def save(self, *args, **kwargs):
+        # Detect updates to start/end times so we can propagate changes to
+        # EmployeeShiftHistory entries that rely on the Shift defaults.
+        is_update = bool(self.pk)
+        old_start = old_end = None
+        if is_update:
+            try:
+                old = Shift.objects.get(pk=self.pk)
+                old_start, old_end = old.start_time, old.end_time
+            except Shift.DoesNotExist:
+                old_start = old_end = None
+
+        super().save(*args, **kwargs)
+
+        # If shift times changed, clear stored per-history start/end so those
+        # histories fall back to the Shift's current times. Use queryset.update
+        # to avoid triggering EmployeeShiftHistory.save auto-population.
+        if is_update and (old_start != self.start_time or old_end != self.end_time):
+            try:
+                # Only clear history times that match the old shift times —
+                # this preserves histories which intentionally override times.
+                q = EmployeeShiftHistory.objects.filter(shift=self)
+                if old_start is not None:
+                    q = q.filter(shift_start_time=old_start)
+                if old_end is not None:
+                    q = q.filter(shift_end_time=old_end)
+                q.update(shift_start_time=None, shift_end_time=None)
+            except Exception:
+                pass
 
 
 class Employee(models.Model):
@@ -254,6 +285,10 @@ def get_employee_shift_times(employee, target_date=None):
     return (None, None)
 
 
+# Grace period for lateness in minutes (configurable via Django settings)
+LATE_GRACE_MINUTES = getattr(settings, 'LATE_GRACE_MINUTES', 10)
+
+
 def get_approved_overtime_for_date(employee, target_date):
     """Returns the first approved Overtime record for an employee on a date, or None."""
     return Overtime.objects.filter(
@@ -384,7 +419,8 @@ class Attendance(models.Model):
         end_time = shift_entry.shift_end_time
         if end_time and end_time <= shift_start_time and shift_start > self.check_in:
             shift_start = shift_start - timedelta(days=1)
-        return self.check_in > shift_start
+        # Respect configured grace period
+        return self.check_in > (shift_start + timedelta(minutes=LATE_GRACE_MINUTES))
 
 
 class PaidLeave(models.Model):

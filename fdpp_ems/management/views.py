@@ -5,6 +5,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.decorators import api_view, permission_classes
+from rest_framework.pagination import PageNumberPagination
 from django_filters import rest_framework as filters
 from django.contrib.auth.models import User
 from .models import Employee, Attendance, PaidLeave, Shift, UserAccessLevel, InactiveAttendanceAttempt, EmployeeShiftHistory, Holiday, Overtime, get_employee_shift_times, get_overtime_max_allowed
@@ -29,6 +30,9 @@ try:
     from openpyxl.utils import get_column_letter
 except Exception:
     openpyxl = None
+
+# Grace period for lateness in minutes (configurable via Django settings)
+LATE_GRACE_MINUTES = getattr(settings, 'LATE_GRACE_MINUTES', 10)
 
 # Permission check: Only admins can create admin/manager
 def is_admin(user):
@@ -1528,60 +1532,39 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             max_allowed = get_overtime_max_allowed(employee, last_att.check_in)
             if duration > max_allowed:
                 # Auto-check-out at shift end and create a new attendance (check-in)
-                if s_end:
-                    shift_end_dt = datetime.combine(last_att.date, s_end)
-                    if s_start and s_end <= s_start:
-                        shift_end_dt += timedelta(days=1)
-                else:
-                    shift_end_dt = last_att.check_in + timedelta(hours=max_allowed)
-
-                # Ensure shift_end_dt is not in the future beyond 'now'
-                if shift_end_dt > now:
-                    shift_end_dt = now
-
-                # Mark previous attendance as checked out at shift_end_dt and log the auto action in message_late
-                prev_msg = last_att.message_late or ''
-                try:
-                    missing_date = last_att.check_in.date()
-                except Exception:
-                    missing_date = last_att.date
-                missing_note = f"you haven't checked out {missing_date.strftime('%Y-%m-%d')}"
-                last_att.check_out = shift_end_dt
-                last_att.message_late = (prev_msg + ' | ' + missing_note).strip(' |')
-                last_att.save()
-
                 new_status = 'on_time'
                 new_late_msg = None
                 if s_start:
                     new_shift_start = datetime.combine(now.date(), s_start)
                     if s_end and s_end <= s_start and new_shift_start > now:
-                        new_shift_start -= timedelta(days=1)
-                    is_late_new = now > new_shift_start
+                        if now.time() < s_end:
+                            new_shift_start -= timedelta(days=1)
+                    is_late_new = now > new_shift_start + timedelta(minutes=LATE_GRACE_MINUTES)
                     new_status = 'late' if is_late_new else 'on_time'
                     if is_late_new:
                         mins = int((now - new_shift_start).total_seconds() / 60)
                         new_late_msg = f"you are late {mins}m"
 
-                new_att = Attendance.objects.create(
-                    employee=employee,
-                    date=timezone.now().date(),
-                    check_in=now,
-                    status=new_status,
-                    message_late=new_late_msg
-                )
+            new_att = Attendance.objects.create(
+                employee=employee,
+                date=timezone.now().date(),
+                check_in=now,
+                status=new_status,
+                message_late=new_late_msg
+            )
 
-                total_hours_prev = round(min((last_att.check_out - last_att.check_in).total_seconds() / 3600, max_allowed), 2)
+            total_hours_prev = round(min((last_att.check_out - last_att.check_in).total_seconds() / 3600, max_allowed), 2)
 
-                return Response(
-                    {
-                        "message": "Auto check-out performed and new check-in created",
-                        "previous_record": AttendanceSerializer(last_att).data,
-                        "new_record": AttendanceSerializer(new_att).data,
-                        "previous_total_hours": format_hours_display(total_hours_prev),
-                        "previous_total_hours_value": total_hours_prev
-                    },
-                    status=status.HTTP_200_OK
-                )
+            return Response(
+                {
+                    "message": "Auto check-out performed and new check-in created",
+                    "previous_record": AttendanceSerializer(last_att).data,
+                    "new_record": AttendanceSerializer(new_att).data,
+                    "previous_total_hours": format_hours_display(total_hours_prev),
+                    "previous_total_hours_value": total_hours_prev
+                },
+                status=status.HTTP_200_OK
+            )
 
             # Normal check-out within max_allowed hours
             last_att.check_out = now
@@ -1604,9 +1587,10 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         if s_start:
             shift_start_dt = datetime.combine(today, s_start)
             if s_end and s_end <= s_start and shift_start_dt > now:
-                shift_start_dt -= timedelta(days=1)
+                if now.time() < s_end:
+                    shift_start_dt -= timedelta(days=1)
 
-            is_late = now > shift_start_dt
+            is_late = now > shift_start_dt + timedelta(minutes=LATE_GRACE_MINUTES)
             status_val = 'late' if is_late else 'on_time'
             if is_late:
                 minutes_late = int((now - shift_start_dt).total_seconds() / 60)
@@ -1711,21 +1695,22 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             if s_start:
                 shift_start_dt = datetime.combine(today, s_start)
                 if s_end and s_end <= s_start and shift_start_dt > now:
-                    shift_start_dt -= timedelta(days=1)
+                    if now.time() < s_end:
+                        shift_start_dt -= timedelta(days=1)
 
-                is_late = now > shift_start_dt
-                if is_late:
-                    total_minutes = int((now - shift_start_dt).total_seconds() / 60)
-                    # Logic to format as "1h 15m" or just "15m"
-                    if total_minutes >= 60:
-                        hours = total_minutes // 60
-                        minutes = total_minutes % 60
-                        if minutes > 0:
-                            late_msg = f"{hours}h {minutes}m late"
-                        else:
-                            late_msg = f"{hours}h late"
+            is_late = now > shift_start_dt + timedelta(minutes=LATE_GRACE_MINUTES)
+            if is_late:
+                total_minutes = int((now - shift_start_dt).total_seconds() / 60)
+                # Logic to format as "1h 15m" or just "15m"
+                if total_minutes >= 60:
+                    hours = total_minutes // 60
+                    minutes = total_minutes % 60
+                    if minutes > 0:
+                        late_msg = f"{hours}h {minutes}m late"
                     else:
-                        late_msg = f"{total_minutes}m late"
+                        late_msg = f"{hours}h late"
+                else:
+                    late_msg = f"{total_minutes}m late"
 
             status_val = 'late' if is_late else 'on_time'
 
@@ -1776,8 +1761,9 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 if s_start:
                     new_shift_start = datetime.combine(now.date(), s_start)
                     if s_end and s_end <= s_start and new_shift_start > now:
-                        new_shift_start -= timedelta(days=1)
-                    is_late_new = now > new_shift_start
+                        if now.time() < s_end:
+                            new_shift_start -= timedelta(days=1)
+                    is_late_new = now > new_shift_start + timedelta(minutes=LATE_GRACE_MINUTES)
                     new_status = 'late' if is_late_new else 'on_time'
                     if is_late_new:
                         mins = int((now - new_shift_start).total_seconds() / 60)
@@ -1906,10 +1892,15 @@ class PaidLeaveViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(leaves, many=True)
         return Response(serializer.data)
 
+class ShiftPagination(PageNumberPagination):
+    page_size_query_param = 'page_size'
+
+
 class ShiftViewSet(viewsets.ModelViewSet):
     queryset = Shift.objects.all()
     serializer_class = ShiftSerializer
     permission_classes = [IsAuthenticated]
+    pagination_class = ShiftPagination
 
 
 class HolidayViewSet(viewsets.ModelViewSet):
@@ -1923,7 +1914,7 @@ class OvertimeViewSet(viewsets.ModelViewSet):
     serializer_class = OvertimeSerializer
     permission_classes = [IsAuthenticated]
     filter_backends = (filters.DjangoFilterBackend,)
-    filterset_fields = ['date', 'employee', 'status']
+    filterset_fields = ['date', 'employee__emp_id', 'status']
 
     def perform_create(self, serializer):
         serializer.save()
@@ -1935,6 +1926,17 @@ class OvertimeViewSet(viewsets.ModelViewSet):
         if ot.status != 'pending':
             return Response({"error": "Overtime is not in pending status."}, status=status.HTTP_400_BAD_REQUEST)
         ot.status = 'approved'
+        ot.approved_by = request.user if request.user.is_authenticated else None
+        ot.save()
+        return Response(OvertimeSerializer(ot).data)
+
+    @action(detail=True, methods=['post'])
+    def reject(self, request, pk=None):
+        """Reject an overtime request."""
+        ot = self.get_object()
+        if ot.status != 'pending':
+            return Response({"error": "Overtime is not in pending status."}, status=status.HTTP_400_BAD_REQUEST)
+        ot.status = 'rejected'
         ot.approved_by = request.user if request.user.is_authenticated else None
         ot.save()
         return Response(OvertimeSerializer(ot).data)
@@ -1988,16 +1990,14 @@ def _build_excel_response(output_data, start_date, end_date):
                 row_data.append(f"Holiday: {hn}" if hn else "Holiday")
             elif status_val == 'off_day':
                 row_data.append('Off Day')
-            elif cell.get('in_time') and cell.get('out_time'):
-                in_str = cell['in_time'].strftime('%H:%M') if cell['in_time'] else '--:--'
-                out_str = cell['out_time'].strftime('%H:%M') if cell['out_time'] else '--:--'
+            else:
+                in_str = cell.get('in_time') or '--:--'
+                out_str = cell.get('out_time') or '--:--'
                 val = f"{in_str} - {out_str}"
                 ot_h = cell.get('overtime_hours', 0)
                 if ot_h and float(ot_h) > 0:
                     val += f" (OT:{ot_h}h)"
                 row_data.append(val)
-            else:
-                row_data.append('--:-- - --:--')
         ws.append(row_data)
 
     summary_start = len(matrix) + 3
@@ -2041,17 +2041,14 @@ def _build_excel_response(output_data, start_date, end_date):
     gt = output_data['grand_totals']
     ws.cell(row=gt_row, column=1, value='GRAND TOTALS').font = summary_font
     gt_fields = [('Total Hours', 'total_hours'), ('Total OT', 'total_overtime_hours'), ('Total Salary', 'total_salary')]
-    for e_idx, emp_id_str in enumerate(emp_ids):
-        col = 2 + e_idx * 2
-        ws.cell(row=gt_row, column=col, value='').font = summary_font
-        ws.merge_cells(start_row=gt_row, start_column=col, end_row=gt_row, end_column=col + 1)
     for gt_idx, (gt_label, gt_field) in enumerate(gt_fields):
         r = gt_row + 1 + gt_idx
         ws.cell(row=r, column=1, value=gt_label).font = summary_font
-        for e_idx, emp_id_str in enumerate(emp_ids):
-            col = 2 + e_idx * 2
-            ws.cell(row=r, column=col, value=gt[gt_field]).font = summary_font
-            ws.merge_cells(start_row=r, start_column=col, end_row=r, end_column=col + 1)
+        last_col = 2 + (len(employees) - 1) * 2 + 1 if employees else 2
+        ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=last_col)
+        cell = ws.cell(row=r, column=2, value=gt[gt_field])
+        cell.font = summary_font
+        cell.alignment = openpyxl.styles.Alignment(horizontal='left')
 
     ws.column_dimensions['A'].width = 14
     ws.column_dimensions['B'].width = 10
@@ -2233,9 +2230,11 @@ class ComprehensiveReportView(APIView):
                 if ot_rec:
                     ot_hours = float(ot_rec.total_hours)
 
+                in_str = in_time.strftime('%I:%M:%S %p') if in_time else None
+                out_str = out_time.strftime('%I:%M:%S %p') if out_time else None
                 cells[str(emp_id)] = {
-                    'in_time': in_time,
-                    'out_time': out_time,
+                    'in_time': in_str,
+                    'out_time': out_str if out_str else (' --:-- ' if in_str else None),
                     'status': status_val,
                     'overtime_hours': round(ot_hours, 2),
                     'leave': on_leave,
@@ -2401,14 +2400,3 @@ class ComprehensiveReportView(APIView):
             return _build_excel_response(output_data, start_date, end_date)
 
         return Response(output_data)
-
-    @action(detail=True, methods=['post'])
-    def reject(self, request, pk=None):
-        """Reject an overtime request."""
-        ot = self.get_object()
-        if ot.status != 'pending':
-            return Response({"error": "Overtime is not in pending status."}, status=status.HTTP_400_BAD_REQUEST)
-        ot.status = 'rejected'
-        ot.approved_by = request.user if request.user.is_authenticated else None
-        ot.save()
-        return Response(OvertimeSerializer(ot).data)

@@ -12,6 +12,9 @@ from django.utils import timezone
 import logging
 from django.conf import settings
 
+# Grace period for lateness in minutes (configurable via Django settings)
+LATE_GRACE_MINUTES = getattr(settings, 'LATE_GRACE_MINUTES', 10)
+
 class BiometricConsumer(AsyncWebsocketConsumer):
     """WebSocket consumer for real-time biometric device events"""
     
@@ -127,9 +130,10 @@ class BiometricConsumer(AsyncWebsocketConsumer):
                     shift_start_dt = datetime.combine(today, s_start)
                     # Adjust for overnight shifts
                     if s_end and s_end <= s_start and shift_start_dt > now:
-                        shift_start_dt -= timedelta(days=1)
+                        if now.time() < s_end:
+                            shift_start_dt -= timedelta(days=1)
 
-                    is_late = now > shift_start_dt
+                    is_late = now > shift_start_dt + timedelta(minutes=LATE_GRACE_MINUTES)
                     if is_late:
                         total_minutes = int((now - shift_start_dt).total_seconds() / 60)
                         if total_minutes >= 60:
@@ -186,8 +190,9 @@ class BiometricConsumer(AsyncWebsocketConsumer):
                     if s_start:
                         new_shift_start = datetime.combine(now.date(), s_start)
                         if s_end and s_end <= s_start and new_shift_start > now:
-                            new_shift_start -= timedelta(days=1)
-                        is_late_new = now > new_shift_start
+                            if now.time() < s_end:
+                                new_shift_start -= timedelta(days=1)
+                        is_late_new = now > new_shift_start + timedelta(minutes=LATE_GRACE_MINUTES)
                         new_status = 'late' if is_late_new else 'on_time'
                         if is_late_new:
                             mins = int((now - new_shift_start).total_seconds() / 60)
