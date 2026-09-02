@@ -18,6 +18,22 @@ LATE_GRACE_MINUTES = getattr(settings, 'LATE_GRACE_MINUTES', 10)
 class BiometricConsumer(AsyncWebsocketConsumer):
     """WebSocket consumer for real-time biometric device events"""
     
+    @database_sync_to_async
+    def _check_duplicate(self, emp_id, now):
+        """Check if this employee has any scan (in or out) within the last 10 seconds."""
+        close_old_connections()
+        try:
+            employee = Employee.objects.get(emp_id=emp_id)
+        except Employee.DoesNotExist:
+            return False, 0
+        last_att = Attendance.objects.filter(employee=employee).order_by('-check_in').first()
+        if last_att:
+            last_event = last_att.check_out if last_att.check_out else last_att.check_in
+            elapsed = int((now - last_event).total_seconds())
+            if elapsed < 10:
+                return True, 10 - elapsed
+        return False, 0
+    
     async def connect(self):
         await self.channel_layer.group_add("biometric_device", self.channel_name)
         await self.accept()
@@ -37,8 +53,20 @@ class BiometricConsumer(AsyncWebsocketConsumer):
             emp_id = data.get('emp_id')
             timestamp = data.get('timestamp')
             if emp_id:
-                # Process the scan using the synchronized logic (pass timestamp if provided)
-                response = await self.process_biometric_scan(emp_id, timestamp)
+                # Dedup check in async context BEFORE calling process_biometric_scan
+                now = datetime.now()
+                is_dup, wait = await self._check_duplicate(emp_id, now)
+                if is_dup:
+                    await self.channel_layer.group_send(
+                        "biometric_device",
+                        {
+                            "type": "biometric_duplicate",
+                            "message": f"You already marked your attendance, Wait for {wait}s to try again"
+                        }
+                    )
+                    return
+
+                response = await self.process_biometric_scan(emp_id, timestamp, now)
                 
                 # Broadcast the result to the frontend
                 await self.channel_layer.group_send(
@@ -51,6 +79,13 @@ class BiometricConsumer(AsyncWebsocketConsumer):
         except Exception as e:
             await self.send(json.dumps({"type": "error", "error": str(e)}))
 
+    async def biometric_duplicate(self, event):
+        """Sends duplicate warning in the exact format the user requested"""
+        await self.send(text_data=json.dumps({
+            "type": "biometric_attendance",
+            "message": event["message"],
+        }))
+
     async def biometric_event(self, event):
         """Receives data from group_send and sends to Frontend"""
         # Matches the structure the frontend expects
@@ -61,29 +96,26 @@ class BiometricConsumer(AsyncWebsocketConsumer):
         }))
 
     @database_sync_to_async
-    def process_biometric_scan(self, emp_id, timestamp_in=None):
+    def process_biometric_scan(self, emp_id, timestamp_in=None, now=None):
         """Synchronized Logic: Matches auto_attendance view exactly"""
         try:
             # Ensure any stale DB connections are closed before using ORM
             close_old_connections()
             employee = Employee.objects.get(emp_id=emp_id)
-            # FIXED: Use system clock (Naive) to match settings.USE_TZ = False
-            # Prefer client-sent timestamp if provided
-            now = None
-            if timestamp_in:
-                try:
-                    # try ISO or common format
+            # Use passed-in now (from dedup) or compute from timestamp / system clock
+            if now is None:
+                if timestamp_in:
                     try:
-                        now = datetime.fromisoformat(str(timestamp_in))
+                        try:
+                            now = datetime.fromisoformat(str(timestamp_in))
+                        except Exception:
+                            now = datetime.strptime(str(timestamp_in), '%Y-%m-%d %H:%M:%S')
                     except Exception:
-                        now = datetime.strptime(str(timestamp_in), '%Y-%m-%d %H:%M:%S')
-                except Exception:
+                        now = datetime.now()
+                else:
                     now = datetime.now()
-            else:
-                now = datetime.now()
             logger = logging.getLogger(__name__)
             today = now.date()
-            current_time = now.time()
             
             # Use same logic as HTTP auto_attendance: consider latest attendance
             last_attendance = Attendance.objects.filter(employee=employee).order_by('-check_in').first()
@@ -108,7 +140,6 @@ class BiometricConsumer(AsyncWebsocketConsumer):
                     pass
                 return {"type": "error", "error": "Employee inactive", "emp_id": emp_id}
             
-            did_modify = False
             # Prepare the exact data structure your frontend UI needs
             shift_name = employee.current_shift.name if employee.current_shift else "N/A"
             attendance_info = {
@@ -145,21 +176,13 @@ class BiometricConsumer(AsyncWebsocketConsumer):
 
                 status_val = 'late' if is_late else 'on_time'
 
-                # Deduplicate creation within small time window
-                window_start = now - timedelta(seconds=5)
-                window_end = now + timedelta(seconds=5)
-                existing = Attendance.objects.filter(employee=employee, check_in__range=[window_start, window_end]).first()
-                if existing:
-                    attendance = existing
-                else:
-                    attendance = Attendance.objects.create(
-                        employee=employee,
-                        date=today,
-                        check_in=now,
-                        message_late=late_msg,
-                        status=status_val
-                    )
-                    did_modify = True
+                Attendance.objects.create(
+                    employee=employee,
+                    date=today,
+                    check_in=now,
+                    message_late=late_msg,
+                    status=status_val
+                )
 
                 attendance_info.update({
                     "action": "check_in",
@@ -198,21 +221,13 @@ class BiometricConsumer(AsyncWebsocketConsumer):
                             mins = int((now - new_shift_start).total_seconds() / 60)
                             new_late_msg = f"you are late {mins}m"
 
-                    # Deduplicate new check-in creation
-                    window_start = now - timedelta(seconds=5)
-                    window_end = now + timedelta(seconds=5)
-                    existing_new = Attendance.objects.filter(employee=employee, check_in__range=[window_start, window_end]).first()
-                    if existing_new:
-                        new_att = existing_new
-                    else:
-                        new_att = Attendance.objects.create(
-                            employee=employee,
-                            date=timezone.now().date(),
-                            check_in=now,
-                            status=new_status,
-                            message_late=new_late_msg
-                        )
-                        did_modify = True
+                    new_att = Attendance.objects.create(
+                        employee=employee,
+                        date=timezone.now().date(),
+                        check_in=now,
+                        status=new_status,
+                        message_late=new_late_msg
+                    )
 
                     # Return a standard check-in style response for the new attendance
                     action = "check_in"
@@ -229,12 +244,27 @@ class BiometricConsumer(AsyncWebsocketConsumer):
                     # Standard check-out path: close the open attendance
                     last_attendance.check_out = now
                     last_attendance.save()
-                    did_modify = True
 
                     total_hours = 0
+                    regular_hours = 0
+                    overtime_hours = 0
                     if first_checkin:
                         total_duration = (now - first_checkin.check_in).total_seconds() / 3600
                         total_hours = round(min(total_duration, max_allowed), 2)
+                        # Auto overtime: hours worked after shift end
+                        if s_end:
+                            shift_end_dt = datetime.combine(today, s_end)
+                            if s_end <= s_start:
+                                shift_end_dt += timedelta(days=1)
+                            if now > shift_end_dt:
+                                ot_sec = (now - shift_end_dt).total_seconds()
+                                overtime_hours = round(max(0, ot_sec / 3600), 2)
+                                reg_sec = (shift_end_dt - first_checkin.check_in).total_seconds()
+                                regular_hours = round(max(0, reg_sec / 3600), 2)
+                            else:
+                                regular_hours = total_hours
+                        else:
+                            regular_hours = total_hours
 
                     action = "check_out"
                     attendance_info.update({
@@ -244,7 +274,9 @@ class BiometricConsumer(AsyncWebsocketConsumer):
                         "is_late": False,
                         "late_message": None,
                         "total_hours_today": total_hours,
-                        "total_hours_today_value": total_hours
+                        "total_hours_today_value": total_hours,
+                        "regular_hours": regular_hours,
+                        "overtime_hours": overtime_hours
                     })
 
             # Note: broadcasting to the channel layer is handled by the async

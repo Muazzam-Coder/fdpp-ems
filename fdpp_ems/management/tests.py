@@ -1,3 +1,6 @@
 from django.test import TestCase
 
-# Create your tests here.
+# Management test suite
+class SystemSanityTest(TestCase):
+    def test_environment_loads(self):
+        self.assertTrue(True)

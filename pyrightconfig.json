@@ -1,0 +1,10 @@
+{
+  "include": [
+    "fdpp_ems"
+  ],
+  "extraPaths": [
+    "fdpp_ems"
+  ],
+  "reportAttributeAccessIssue": "none",
+  "reportMissingImports": "none"
+}

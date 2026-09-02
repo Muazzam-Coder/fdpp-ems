@@ -1,12 +1,10 @@
 from django.db import models
 from django.contrib.auth.models import User
-from django.core.validators import RegexValidator, MinValueValidator, MaxValueValidator
 from django.utils import timezone
 from django.db.models.signals import pre_save, post_save
 from django.dispatch import receiver
-from datetime import timedelta, datetime, time
+from datetime import timedelta, datetime
 from django.conf import settings
-from decimal import Decimal
 
 def get_current_date():
     """Get current date for default field value"""
@@ -123,7 +121,7 @@ class Employee(models.Model):
     CNIC = models.CharField(max_length=20, unique=True, null=True, blank=True)
     relative = models.CharField(max_length=255, null=True, blank=True)
     referance = models.TextField(null=True, blank=True)
-    relatives = models.ManyToManyField('self', symmetrical=True, blank=True, related_name='related_to')
+    relatives = models.ManyToManyField('self', symmetrical=True, blank=True)
     r_phone = models.CharField(max_length=20, null=True, blank=True)
     r_address = models.TextField(null=True, blank=True)
 
@@ -220,6 +218,56 @@ class EmployeeShiftHistory(models.Model):
         self.save()
 
 
+class Salary(models.Model):
+    employee = models.ForeignKey(
+        Employee, on_delete=models.CASCADE, related_name='salaries'
+    )
+    salary = models.DecimalField(max_digits=10, decimal_places=2)
+    effective_from = models.DateField()
+    effective_to = models.DateField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-effective_from']
+        indexes = [
+            models.Index(fields=['employee', 'effective_from']),
+            models.Index(fields=['employee', 'effective_to']),
+        ]
+        verbose_name_plural = 'Salaries'
+
+    def __str__(self):
+        to = self.effective_to or 'Present'
+        return f"{self.employee.name} - {self.salary} ({self.effective_from} to {to})"
+
+    def save(self, *args, **kwargs):
+        is_new = not self.pk
+        if is_new and self.effective_from:
+            # Close the previous salary entry
+            prev = Salary.objects.filter(
+                employee=self.employee, effective_to__isnull=True
+            ).exclude(pk=self.pk).first()
+            if prev:
+                prev.effective_to = self.effective_from - timedelta(days=1)
+                prev.save()
+        super().save(*args, **kwargs)
+        if is_new:
+            # Update Employee.salary to match for convenience
+            Employee.objects.filter(pk=self.employee_id).update(salary=self.salary)
+
+
+def get_salary_for_date(employee, target_date):
+    """Get the Salary entry active for an employee on a given date.
+    Returns the salary Decimal or 0 if none found.
+    """
+    entry = Salary.objects.filter(
+        employee=employee,
+        effective_from__lte=target_date,
+    ).filter(
+        models.Q(effective_to__isnull=True) | models.Q(effective_to__gte=target_date)
+    ).order_by('-effective_from').first()
+    return entry.salary if entry else (employee.salary or 0)
+
+
 class Holiday(models.Model):
     date = models.DateField(unique=True)
     name = models.CharField(max_length=200)
@@ -266,7 +314,7 @@ class Overtime(models.Model):
         if end <= start:
             end += timedelta(days=1)
         duration = (end - start).total_seconds() / 3600
-        return round(min(duration, 14.0), 2)
+        return round(min(duration, 18.0), 2)
 
 
 def get_employee_shift_times(employee, target_date=None):
@@ -300,8 +348,8 @@ def get_overtime_max_allowed(employee, check_in_dt):
     """Calculate overtime-adjusted max hours for an attendance record.
     
     If approved overtime exists for the attendance date, returns the max of
-    14 hours and the hours from check_in to overtime end.
-    Otherwise returns 14.0.
+    18 hours and the hours from check_in to overtime end.
+    Otherwise returns 18.0.
     """
     target_date = check_in_dt.date()
     ot = get_approved_overtime_for_date(employee, target_date)
@@ -310,8 +358,8 @@ def get_overtime_max_allowed(employee, check_in_dt):
         if ot.end_time <= ot.start_time:
             ot_end += timedelta(days=1)
         ot_allowed = (ot_end - check_in_dt).total_seconds() / 3600
-        return max(14.0, ot_allowed)
-    return 14.0
+        return max(18.0, ot_allowed)
+    return 18.0
 
 
 def get_approved_overtime_hours_for_date(employee, target_date):

@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Employee, Attendance, PaidLeave, Shift, UserAccessLevel, EmployeeShiftHistory, Holiday, Overtime
+from .models import Employee, Attendance, PaidLeave, Shift, UserAccessLevel, EmployeeShiftHistory, Holiday, Overtime, Salary
 
 
 @admin.register(UserAccessLevel)
@@ -130,3 +130,11 @@ class OvertimeAdmin(admin.ModelAdmin):
     list_display = ['employee', 'date', 'start_time', 'end_time', 'status', 'approved_by']
     list_filter = ['status', 'date']
     search_fields = ['employee__name', 'employee__emp_id']
+
+
+@admin.register(Salary)
+class SalaryAdmin(admin.ModelAdmin):
+    list_display = ['employee', 'salary', 'effective_from', 'effective_to', 'created_at']
+    list_filter = ['effective_from']
+    search_fields = ['employee__name', 'employee__emp_id']
+    readonly_fields = ['created_at']

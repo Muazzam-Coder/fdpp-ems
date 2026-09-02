@@ -7,17 +7,23 @@ from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.pagination import PageNumberPagination
 from django_filters import rest_framework as filters
-from django.contrib.auth.models import User
-from .models import Employee, Attendance, PaidLeave, Shift, UserAccessLevel, InactiveAttendanceAttempt, EmployeeShiftHistory, Holiday, Overtime, get_employee_shift_times, get_overtime_max_allowed
+from .models import (
+    Employee, Attendance, PaidLeave, Shift, UserAccessLevel,
+    InactiveAttendanceAttempt, EmployeeShiftHistory, Holiday, Overtime,
+    Salary, get_employee_shift_times, get_overtime_max_allowed,
+    get_salary_for_date
+)
 from .serializers import (
     EmployeeSerializer, AttendanceSerializer, PaidLeaveSerializer, 
-    ShiftSerializer, UserSerializer, UserAccessLevelSerializer,
+    ShiftSerializer, UserAccessLevelSerializer,
     CreateAdminManagerSerializer, RegisterSerializer,
     EmployeeShiftHistorySerializer, HolidaySerializer, OvertimeSerializer,
+    SalarySerializer,
     ComprehensiveReportInputSerializer,
 )
-from django.db.models import Sum, Count, Q, Avg
+from django.db.models import Q
 from datetime import datetime, timedelta, date, time
+from decimal import Decimal
 from django.utils import timezone
 from fdpp_ems import settings
 from asgiref.sync import async_to_sync
@@ -30,6 +36,7 @@ try:
     from openpyxl.utils import get_column_letter
 except Exception:
     openpyxl = None
+    get_column_letter = None
 
 # Grace period for lateness in minutes (configurable via Django settings)
 LATE_GRACE_MINUTES = getattr(settings, 'LATE_GRACE_MINUTES', 10)
@@ -159,7 +166,7 @@ class AuthViewSet(viewsets.ViewSet):
                     "designation": employee.designation,
                     "phone": employee.phone,
                     "CNIC": employee.CNIC,
-                    "shift_type": employee.shift_type,
+                    "shift_type": employee.current_shift.name if employee.current_shift else None,
                     "current_shift": employee.current_shift.id if employee.current_shift else None,
                     "current_shift_name": employee.current_shift.name if employee.current_shift else None,
                     "profile_img": f"http://{settings.SERVER_IP}:{settings.SERVER_PORT}{employee.profile_img.url}" if employee.profile_img else None
@@ -406,7 +413,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
 
             # Calculate salary portion based on month days
             monthly_days = month_days_for_period(period_start, period_end)
-            salary_value = float(entry.salary or 0)
+            salary_value = float(get_salary_for_date(employee, period_start) or entry.salary or 0)
             salary_portion = salary_value * (period_days / monthly_days) if monthly_days > 0 else 0
             hourly_rate = salary_portion / expected_hours if expected_hours > 0 else 0
 
@@ -777,6 +784,55 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         serializer = EmployeeShiftHistorySerializer(history_entry)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
+    @action(detail=True, methods=['get', 'post'])
+    def salary(self, request, emp_id=None):
+        """Get salary history or create a new salary record for an employee.
+
+        GET: returns all salary records for the employee.
+        POST body: {"salary": 50000, "effective_from": "YYYY-MM-DD"}
+        """
+        employee = self.get_object()
+
+        if request.method == 'GET':
+            salaries = Salary.objects.filter(employee=employee).order_by('-effective_from')
+            serializer = SalarySerializer(salaries, many=True)
+            return Response(serializer.data)
+
+        salary_val = request.data.get('salary')
+        effective_from_str = request.data.get('effective_from')
+
+        if not salary_val or not effective_from_str:
+            return Response(
+                {"error": "salary and effective_from are required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            effective_from = datetime.strptime(effective_from_str, '%Y-%m-%d').date()
+        except ValueError:
+            return Response(
+                {"error": "Invalid effective_from format. Use YYYY-MM-DD"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            salary_val = Decimal(str(salary_val))
+        except Exception:
+            return Response(
+                {"error": "Invalid salary value"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        salary_entry = Salary(
+            employee=employee,
+            salary=salary_val,
+            effective_from=effective_from,
+        )
+        salary_entry.save()
+
+        serializer = SalarySerializer(salary_entry)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
     @action(detail=True, methods=['get'])
     def shift_history(self, request, emp_id=None):
         """Get all shift assignments for an employee."""
@@ -1009,19 +1065,23 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                     if leave:
                         combined = "Leave"
                     else:
-                        # If employee has no defined shift times, treat past dates as Absent
-                        if not emp.start_time or not emp.end_time:
-                            if rdate < today:
-                                combined = "Absent"
-                            else:
-                                combined = f"{check_in_val} - {check_out_val}"
+                        holiday = Holiday.objects.filter(date=rdate).first()
+                        if holiday:
+                            combined = f"Holiday ({holiday.name})"
+                        elif emp.weekly_off_day is not None and rdate.weekday() == emp.weekly_off_day:
+                            combined = "Off Day"
                         else:
-                            # If the date is past (or today past shift end) mark Absent
-                            if rdate < today or (rdate == today and current_time >= emp.end_time):
-                                combined = "Absent"
+                            s_start, s_end = get_employee_shift_times(emp, rdate)
+                            if not s_start or not s_end:
+                                if rdate < today:
+                                    combined = "Absent"
+                                else:
+                                    combined = f"{check_in_val} - {check_out_val}"
                             else:
-                                # Future or pending day: keep placeholder
-                                combined = f"{check_in_val} - {check_out_val}"
+                                if rdate < today or (rdate == today and current_time >= s_end):
+                                    combined = "Absent"
+                                else:
+                                    combined = f"{check_in_val} - {check_out_val}"
 
                 ws.cell(row=row, column=col, value=combined)
 
@@ -1151,20 +1211,29 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                         check_in_val = "Leave"
                         check_out_val = ""
                     else:
-                        if not emp.start_time or not emp.end_time:
-                            if rdate < today:
-                                check_in_val = "Absent"
-                                check_out_val = ""
-                            else:
-                                check_in_val = "--:--"
-                                check_out_val = "--:--"
+                        holiday = Holiday.objects.filter(date=rdate).first()
+                        if holiday:
+                            check_in_val = f"Holiday ({holiday.name})"
+                            check_out_val = ""
+                        elif emp.weekly_off_day is not None and rdate.weekday() == emp.weekly_off_day:
+                            check_in_val = "Off Day"
+                            check_out_val = ""
                         else:
-                            if rdate < today or (rdate == today and current_time >= emp.end_time):
-                                check_in_val = "Absent"
-                                check_out_val = ""
+                            s_start, s_end = get_employee_shift_times(emp, rdate)
+                            if not s_start or not s_end:
+                                if rdate < today:
+                                    check_in_val = "Absent"
+                                    check_out_val = ""
+                                else:
+                                    check_in_val = "--:--"
+                                    check_out_val = "--:--"
                             else:
-                                check_in_val = "--:--"
-                                check_out_val = "--:--"
+                                if rdate < today or (rdate == today and current_time >= s_end):
+                                    check_in_val = "Absent"
+                                    check_out_val = ""
+                                else:
+                                    check_in_val = "--:--"
+                                    check_out_val = "--:--"
 
                 ws.cell(row=row, column=col, value=f"{check_in_val} - {check_out_val}" if check_out_val else check_in_val)
 
@@ -1300,7 +1369,10 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         start_date = today - timedelta(days=today.weekday())
         end_date = start_date + timedelta(days=6)
 
-        attendances = Attendance.objects.filter(date__range=[start_date, end_date])
+        attendances = Attendance.objects.filter(
+            date__range=[start_date, end_date],
+            employee__status='active'
+        )
 
         # Optional employee filter by emp_id
         emp_param = request.query_params.get('employee')
@@ -1318,6 +1390,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         # Count unique employee-day combinations
         total_working_records = attendances.values('employee', 'date').distinct().count()
         late_arrivals = attendances.filter(status='late').values('employee', 'date').distinct().count()
+        active_employees_count = Employee.objects.filter(status='active').count()
 
         return Response({
             "employee_id": employee_obj.emp_id if employee_obj else None,
@@ -1327,7 +1400,8 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             "total_hours": format_hours_display(total_hours),
             "total_hours_value": total_hours,
             "late_arrivals": late_arrivals,
-            "average_hours_per_day": round(total_hours / 7, 2) if total_working_records > 0 else 0
+            "average_hours_per_day": round(total_hours / 7, 2) if total_working_records > 0 else 0,
+            "active_employees": active_employees_count
         })
 
     @action(detail=False, methods=['get'])
@@ -1523,6 +1597,28 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         # on a previous date will be treated as the next action's check-out.
         last_att = Attendance.objects.filter(employee=employee).order_by('-check_in').first()
 
+        # Unified dedup: reject any scan within 10s of the last event (check_in or check_out)
+        if last_att:
+            last_event = last_att.check_out if last_att.check_out else last_att.check_in
+            elapsed = int((now - last_event).total_seconds())
+            if elapsed < 10:
+                wait = 10 - elapsed
+                channel_layer = get_channel_layer()
+                async_to_sync(channel_layer.group_send)(
+                    "biometric_device",
+                    {
+                        "type": "biometric_duplicate",
+                        "message": f"You already marked your attendance, Wait for {wait}s to try again",
+                    }
+                )
+                return Response(
+                    {
+                        "message": f"You already marked your attendance, Wait for {wait}s to try again",
+                        "duplicate": True,
+                    },
+                    status=status.HTTP_200_OK
+                )
+
         # Get today's shift times
         s_start, s_end = get_employee_shift_times(employee, today)
 
@@ -1531,7 +1627,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             duration = (now - last_att.check_in).total_seconds() / 3600
             max_allowed = get_overtime_max_allowed(employee, last_att.check_in)
             if duration > max_allowed:
-                # Auto-check-out at shift end and create a new attendance (check-in)
+                # Auto-check-out and create a new attendance (check-in)
                 new_status = 'on_time'
                 new_late_msg = None
                 if s_start:
@@ -1545,26 +1641,26 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                         mins = int((now - new_shift_start).total_seconds() / 60)
                         new_late_msg = f"you are late {mins}m"
 
-            new_att = Attendance.objects.create(
-                employee=employee,
-                date=timezone.now().date(),
-                check_in=now,
-                status=new_status,
-                message_late=new_late_msg
-            )
+                new_att = Attendance.objects.create(
+                    employee=employee,
+                    date=timezone.now().date(),
+                    check_in=now,
+                    status=new_status,
+                    message_late=new_late_msg
+                )
 
-            total_hours_prev = round(min((last_att.check_out - last_att.check_in).total_seconds() / 3600, max_allowed), 2)
+                total_hours_prev = round(min((last_att.check_out - last_att.check_in).total_seconds() / 3600, max_allowed), 2) if last_att.check_out else 0
 
-            return Response(
-                {
-                    "message": "Auto check-out performed and new check-in created",
-                    "previous_record": AttendanceSerializer(last_att).data,
-                    "new_record": AttendanceSerializer(new_att).data,
-                    "previous_total_hours": format_hours_display(total_hours_prev),
-                    "previous_total_hours_value": total_hours_prev
-                },
-                status=status.HTTP_200_OK
-            )
+                return Response(
+                    {
+                        "message": "Auto check-out performed and new check-in created",
+                        "previous_record": AttendanceSerializer(last_att).data,
+                        "new_record": AttendanceSerializer(new_att).data,
+                        "previous_total_hours": format_hours_display(total_hours_prev),
+                        "previous_total_hours_value": total_hours_prev
+                    },
+                    status=status.HTTP_200_OK
+                )
 
             # Normal check-out within max_allowed hours
             last_att.check_out = now
@@ -1666,11 +1762,34 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             logger.debug(f"auto_attendance called for emp_id={emp_id}, received_timestamp={timestamp_in}, using_now={now}")
         except Exception:
             pass
+
         today = now.date()
-        current_time = now.time()
         
         # Look for the latest attendance record regardless of date so open check-ins carry over
         last_attendance = Attendance.objects.filter(employee=employee).order_by('-check_in').first()
+
+        # Unified dedup: reject any scan within 10s of the last event (check_in or check_out)
+        if last_attendance:
+            last_event = last_attendance.check_out if last_attendance.check_out else last_attendance.check_in
+            elapsed = int((now - last_event).total_seconds())
+            if elapsed < 10:
+                wait = 10 - elapsed
+                channel_layer = get_channel_layer()
+                async_to_sync(channel_layer.group_send)(
+                    "biometric_device",
+                    {
+                        "type": "biometric_duplicate",
+                        "message": f"You already marked your attendance, Wait for {wait}s to try again",
+                    }
+                )
+                return Response(
+                    {
+                        "message": f"You already marked your attendance, Wait for {wait}s to try again",
+                        "duplicate": True,
+                        "action": "rescan",
+                    },
+                    status=status.HTTP_200_OK
+                )
         # For total hours calculation when checking out, use the last open check-in (the same record)
         first_checkin = None
         if last_attendance and last_attendance.check_out is None:
@@ -1688,6 +1807,8 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         
         # Determine action: Check-in or Check-out
         did_modify = False
+        action = "check_in"
+        message = "Attendance marked"
         if not last_attendance or (last_attendance.check_out is not None):
             # ===== NEW CHECK-IN =====
             is_late = False
@@ -1714,22 +1835,14 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
             status_val = 'late' if is_late else 'on_time'
 
-            # Avoid duplicate creation if a record with near-identical check_in exists
-            window_start = now - timedelta(seconds=5)
-            window_end = now + timedelta(seconds=5)
-            existing = Attendance.objects.filter(employee=employee, check_in__range=[window_start, window_end]).first()
-            if existing:
-                attendance = existing
-            else:
-                attendance = Attendance.objects.create(
-                    employee=employee,
-                    date=today,
-                    check_in=now,
-                    message_late=late_msg,
-                    status=status_val
-                )
-                did_modify = True
-
+            Attendance.objects.create(
+                employee=employee,
+                date=today,
+                check_in=now,
+                message_late=late_msg,
+                status=status_val
+            )
+            did_modify = True
             action = "check_in"
             message = "Check-in successful"
             attendance_info.update({
@@ -1769,23 +1882,14 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                         mins = int((now - new_shift_start).total_seconds() / 60)
                         new_late_msg = f"you are late {mins}m"
 
-                # Deduplicate new check-in creation
-                window_start = now - timedelta(seconds=5)
-                window_end = now + timedelta(seconds=5)
-                existing_new = Attendance.objects.filter(employee=employee, check_in__range=[window_start, window_end]).first()
-                if existing_new:
-                    new_att = existing_new
-                else:
-                    new_att = Attendance.objects.create(
-                        employee=employee,
-                        date=timezone.now().date(),
-                        check_in=now,
-                        status=new_status,
-                        message_late=new_late_msg
-                    )
-                    did_modify = True
-
-                # Keep response shape identical to a normal check-in response
+                new_att = Attendance.objects.create(
+                    employee=employee,
+                    date=timezone.now().date(),
+                    check_in=now,
+                    status=new_status,
+                    message_late=new_late_msg
+                )
+                did_modify = True
                 action = "check_in"
                 message = "Check-in successful"
                 attendance_info.update({
@@ -1803,21 +1907,38 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 did_modify = True
 
                 total_hours = 0
+                regular_hours = 0
+                overtime_hours = 0
                 if first_checkin:
                     total_duration = (now - first_checkin.check_in).total_seconds() / 3600
                     total_hours = round(min(total_duration, max_allowed), 2)
+                    # Auto overtime: hours worked after shift end
+                    if s_end:
+                        shift_end_dt = datetime.combine(today, s_end)
+                        if s_end <= s_start:
+                            shift_end_dt += timedelta(days=1)
+                        if now > shift_end_dt:
+                            ot_sec = (now - shift_end_dt).total_seconds()
+                            overtime_hours = round(max(0, ot_sec / 3600), 2)
+                            reg_sec = (shift_end_dt - first_checkin.check_in).total_seconds()
+                            regular_hours = round(max(0, reg_sec / 3600), 2)
+                        else:
+                            regular_hours = total_hours
+                    else:
+                        regular_hours = total_hours
 
                 action = "check_out"
                 message = "Check-out successful"
                 attendance_info.update({
                     "action": action,
-                    # UPDATED: Just use the time in DB directly (it's already local)
                     "check_in": last_attendance.check_in.strftime('%I:%M %p'),
                     "check_out": now.strftime('%I:%M %p'),
                     "is_late": False,
                     "late_message": None,
                     "total_hours_today": format_hours_display(total_hours),
-                    "total_hours_today_value": total_hours
+                    "total_hours_today_value": total_hours,
+                    "regular_hours": regular_hours,
+                    "overtime_hours": overtime_hours
                 })
 
         response_payload = {
@@ -2180,7 +2301,6 @@ class ComprehensiveReportView(APIView):
             })
 
         matrix = []
-        emp_id_list = [e.emp_id for e in employees_qs]
         current_date = start_date
         today = timezone.now().date()
 
@@ -2188,6 +2308,7 @@ class ComprehensiveReportView(APIView):
             weekday = WEEKDAY_NAMES[current_date.weekday()]
             holiday = holidays_by_date.get(current_date)
             is_holiday = holiday is not None
+            is_off = False
             cells = {}
 
             for emp in employees_qs:
@@ -2218,17 +2339,36 @@ class ComprehensiveReportView(APIView):
                     status_val = 'leave'
                 elif is_holiday:
                     status_val = 'holiday'
-                elif is_off:
-                    status_val = 'off_day'
                 elif att:
                     in_time = att.check_in.time() if att.check_in else None
                     out_time = att.check_out.time() if att.check_out else None
                     status_val = att.status
+                    # Auto overtime from attendance (after shift end)
+                    emp_sh = sh_map.get(emp_id, [])
+                    app_sh = None
+                    for sh_entry in emp_sh:
+                        sh_from = sh_entry.from_date
+                        sh_to = sh_entry.to_date if sh_entry.to_date else end_date
+                        if sh_from <= current_date <= sh_to:
+                            app_sh = sh_entry
+                            break
+                    if app_sh and app_sh.shift:
+                        ot_s_start = app_sh.shift_start_time or app_sh.shift.start_time
+                        ot_s_end = app_sh.shift_end_time or app_sh.shift.end_time
+                        if att.check_out and ot_s_start and ot_s_end:
+                            att_shift_end = datetime.combine(current_date, ot_s_end)
+                            if ot_s_end <= ot_s_start:
+                                att_shift_end += timedelta(days=1)
+                            if att.check_out > att_shift_end:
+                                auto_ot = (att.check_out - att_shift_end).total_seconds() / 3600
+                                ot_hours += max(0, auto_ot)
+                elif is_off:
+                    status_val = 'off_day'
                 else:
                     status_val = 'absent' if current_date < today else 'absent'
 
                 if ot_rec:
-                    ot_hours = float(ot_rec.total_hours)
+                    ot_hours += float(ot_rec.total_hours)
 
                 in_str = in_time.strftime('%I:%M:%S %p') if in_time else None
                 out_str = out_time.strftime('%I:%M:%S %p') if out_time else None
@@ -2248,7 +2388,7 @@ class ComprehensiveReportView(APIView):
                 'date': current_date,
                 'weekday': weekday,
                 'is_holiday': is_holiday,
-                'is_off_day': False,
+                'is_off_day': is_off,
                 'cells': cells,
             })
 
@@ -2307,13 +2447,15 @@ class ComprehensiveReportView(APIView):
                 if s_seconds <= 0:
                     s_seconds += 86400
                 shift_hours = s_seconds / 3600
-                salary_value = applicable_sh.salary or emp.salary or 0
+                salary_value = get_salary_for_date(emp, d) or applicable_sh.salary or emp.salary or 0
                 hourly_rate_val = _prorate_salary(salary_value, 1) / shift_hours if shift_hours > 0 else 0
 
                 date_shift_info[d] = {
                     'shift_hours': shift_hours,
                     'salary_value': float(salary_value),
                     'hourly_rate': hourly_rate_val,
+                    's_start': s_start,
+                    's_end': s_end,
                 }
 
             for row in matrix:
@@ -2337,6 +2479,16 @@ class ComprehensiveReportView(APIView):
                     total_hours += day_hours
                     days_present += 1
                     regular_pay += day_hours * hr
+                    # Auto overtime from attendance (after shift end)
+                    s_start_i = si.get('s_start')
+                    s_end_i = si.get('s_end')
+                    if att and att.check_out and s_start_i and s_end_i:
+                        att_shift_end = datetime.combine(d, s_end_i)
+                        if s_end_i <= s_start_i:
+                            att_shift_end += timedelta(days=1)
+                        if att.check_out > att_shift_end:
+                            auto_ot = (att.check_out - att_shift_end).total_seconds() / 3600
+                            ot_h += max(0, auto_ot)
                 elif st == 'absent':
                     days_absent += 1
                 elif st == 'leave':
@@ -2354,7 +2506,7 @@ class ComprehensiveReportView(APIView):
 
                 if ot_h > 0:
                     total_ot_hours += ot_h
-                    overtime_pay += ot_h * hr * 1.5
+                    overtime_pay += ot_h * hr
 
             total_salary = regular_pay + overtime_pay + holiday_pay + leave_pay + off_day_pay
 

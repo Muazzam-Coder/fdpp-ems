@@ -1,8 +1,11 @@
 from rest_framework import serializers
 from django.contrib.auth.models import User
-from .models import Employee, Attendance, PaidLeave, Shift, UserAccessLevel, EmployeeShiftHistory, Holiday, Overtime, get_overtime_max_allowed
-from django.utils import timezone
-from datetime import datetime
+from .models import (
+    Employee, Attendance, PaidLeave, Shift, UserAccessLevel,
+    UserProfile, EmployeeShiftHistory, Holiday, Overtime, Salary,
+    get_overtime_max_allowed, get_employee_shift_times,
+)
+from datetime import datetime, timedelta
 
 
 def format_hours_display(hours_value):
@@ -182,8 +185,6 @@ class CreateAdminManagerSerializer(serializers.Serializer):
         return value
 
     def create(self, validated_data):
-        from .models import UserProfile
-
         role = validated_data.pop('role')
         profile_img = validated_data.pop('profile_img', None)
 
@@ -228,17 +229,17 @@ class EmployeeSerializer(serializers.ModelSerializer):
     current_shift_detail = ShiftSerializer(source='current_shift', read_only=True)
 
     class EmpIdOrPkField(serializers.SlugRelatedField):
-        def to_internal_value(self, value):
+        def to_internal_value(self, data):
             qs = self.get_queryset()
-            if value is None:
+            if qs is None or data is None:
                 return None
-            if isinstance(value, int):
+            if isinstance(data, int):
                 try:
-                    return qs.get(pk=value)
+                    return qs.get(pk=data)
                 except Exception:
-                    raise serializers.ValidationError(f"Employee with pk '{value}' does not exist")
+                    raise serializers.ValidationError(f"Employee with pk '{data}' does not exist")
 
-            v = str(value).strip()
+            v = str(data).strip()
             if v == '':
                 return None
             try:
@@ -249,7 +250,7 @@ class EmployeeSerializer(serializers.ModelSerializer):
                         return qs.get(pk=int(v))
                     except Exception:
                         pass
-                raise serializers.ValidationError(f"Employee with emp_id or pk '{value}' does not exist")
+                raise serializers.ValidationError(f"Employee with emp_id or pk '{data}' does not exist")
 
     relatives = EmpIdOrPkField(many=True, slug_field='emp_id', queryset=Employee.objects.all(), required=False)
 
@@ -287,8 +288,8 @@ class AttendanceSerializer(serializers.ModelSerializer):
     total_hours_value = serializers.SerializerMethodField()
     is_late = serializers.ReadOnlyField()
     employee_name = serializers.CharField(source='employee.name', read_only=True)
-    check_in_time = serializers.TimeField(write_only=True, format='%I:%M:%S %p')
-    check_out_time = serializers.TimeField(write_only=True, format='%I:%M:%S %p', required=False, allow_null=True)
+    check_in_time = serializers.TimeField(write_only=True, input_formats=['%I:%M:%S %p', '%I:%M %p', '%H:%M:%S', '%H:%M'])
+    check_out_time = serializers.TimeField(write_only=True, input_formats=['%I:%M:%S %p', '%I:%M %p', '%H:%M:%S', '%H:%M'], required=False, allow_null=True)
     check_in = serializers.SerializerMethodField(read_only=True)
     check_out = serializers.SerializerMethodField(read_only=True)
 
@@ -317,9 +318,9 @@ class AttendanceSerializer(serializers.ModelSerializer):
             return obj.check_out.strftime('%I:%M:%S %p')
         return None
 
-    def validate(self, data):
-        check_in_time = data.get('check_in_time')
-        check_out_time = data.get('check_out_time')
+    def validate(self, attrs):
+        check_in_time = attrs.get('check_in_time')
+        check_out_time = attrs.get('check_out_time')
 
         if check_in_time and check_out_time:
             if check_out_time < check_in_time:
@@ -331,18 +332,22 @@ class AttendanceSerializer(serializers.ModelSerializer):
 
             duration_hours = (temp_check_out - temp_check_in).total_seconds() / 3600
             max_allowed = 14.0
-            employee_id = data.get('employee')
-            if employee_id:
-                try:
-                    emp = Employee.objects.get(emp_id=employee_id)
+            employee_val = attrs.get('employee')
+            if employee_val:
+                if isinstance(employee_val, Employee):
+                    emp = employee_val
                     max_allowed = get_overtime_max_allowed(emp, temp_check_in)
-                except Employee.DoesNotExist:
-                    pass
+                else:
+                    try:
+                        emp = Employee.objects.get(emp_id=employee_val)
+                        max_allowed = get_overtime_max_allowed(emp, temp_check_in)
+                    except Employee.DoesNotExist:
+                        pass
             if duration_hours > max_allowed:
                 raise serializers.ValidationError(
                     f"Work duration cannot exceed {max_allowed:.0f} hours per shift."
                 )
-        return data
+        return attrs
 
     def create(self, validated_data):
         check_in_time = validated_data.pop('check_in_time')
@@ -384,10 +389,10 @@ class PaidLeaveSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['created_at', 'updated_at']
 
-    def validate(self, data):
-        if data['start_time'] >= data['end_time']:
+    def validate(self, attrs):
+        if attrs['start_time'] >= attrs['end_time']:
             raise serializers.ValidationError("End time must be after start time.")
-        return data
+        return attrs
 
 
 class HolidaySerializer(serializers.ModelSerializer):
@@ -412,11 +417,11 @@ class OvertimeSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['created_at', 'updated_at', 'approved_by', 'status']
 
-    def validate(self, data):
-        employee = data.get('employee')
-        date = data.get('date')
-        start_time = data.get('start_time')
-        end_time = data.get('end_time')
+    def validate(self, attrs):
+        employee = attrs.get('employee')
+        date = attrs.get('date')
+        start_time = attrs.get('start_time')
+        end_time = attrs.get('end_time')
 
         if employee and date and start_time and end_time:
             if end_time <= start_time:
@@ -427,12 +432,9 @@ class OvertimeSerializer(serializers.ModelSerializer):
                           date.weekday() == employee.weekly_off_day)
 
             if not is_holiday and not is_off_day:
-                from .models import get_employee_shift_times
                 s_start, s_end = get_employee_shift_times(employee, date)
 
                 if s_start and s_end:
-                    from datetime import timedelta
-
                     shift_start_dt = datetime.combine(date, s_start)
                     shift_end_dt = datetime.combine(date, s_end)
                     if shift_end_dt <= shift_start_dt:
@@ -448,7 +450,14 @@ class OvertimeSerializer(serializers.ModelSerializer):
                             "Overtime must start after shift end time."
                         )
 
-        return data
+        return attrs
+
+
+class SalarySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Salary
+        fields = ['id', 'employee', 'salary', 'effective_from', 'effective_to', 'created_at']
+        read_only_fields = ['id', 'employee', 'effective_to', 'created_at']
 
 
 class ComprehensiveReportInputSerializer(serializers.Serializer):
@@ -465,9 +474,9 @@ class ComprehensiveReportInputSerializer(serializers.Serializer):
         required=False,
     )
 
-    def validate(self, data):
-        if data['start_date'] > data['end_date']:
+    def validate(self, attrs):
+        if attrs['start_date'] > attrs['end_date']:
             raise serializers.ValidationError("start_date must be before or equal to end_date")
-        if (data['end_date'] - data['start_date']).days > 90:
+        if (attrs['end_date'] - attrs['start_date']).days > 90:
             raise serializers.ValidationError("Date range cannot exceed 90 days")
-        return data
+        return attrs
