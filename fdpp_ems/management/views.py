@@ -2074,66 +2074,271 @@ def _prorate_salary(salary_value, period_days):
 
 
 def _build_excel_response(output_data, start_date, end_date):
+    if openpyxl is None:
+        return HttpResponse("openpyxl is required to generate Excel files", status=500)
+
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Comprehensive Report"
 
-    header_font = openpyxl.styles.Font(bold=True)
-    summary_font = openpyxl.styles.Font(bold=True, color="003366")
+    # Ensure grid lines are visible
+    ws.views.sheetView[0].showGridLines = True
+
+    # Typography & Fonts
+    title_font = openpyxl.styles.Font(name="Calibri", size=14, bold=True, color="1E3A8A")
+    subtitle_font = openpyxl.styles.Font(name="Calibri", size=10, italic=True, color="475569")
+    
+    header_font = openpyxl.styles.Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    meta_label_font = openpyxl.styles.Font(name="Calibri", size=10, bold=True, color="1E293B")
+    meta_val_hours_font = openpyxl.styles.Font(name="Calibri", size=10, bold=True, color="1E40AF")
+    meta_val_off_font = openpyxl.styles.Font(name="Calibri", size=10, bold=True, color="0F766E")
+    
+    regular_font = openpyxl.styles.Font(name="Calibri", size=10, color="0F172A")
+    date_font = openpyxl.styles.Font(name="Calibri", size=10, bold=True, color="1E293B")
+    weekend_date_font = openpyxl.styles.Font(name="Calibri", size=10, bold=True, color="B91C1C")
+    
+    summary_header_font = openpyxl.styles.Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    summary_label_font = openpyxl.styles.Font(name="Calibri", size=10, bold=True, color="1E293B")
+    summary_val_font = openpyxl.styles.Font(name="Calibri", size=10, color="0F172A")
+    grand_total_font = openpyxl.styles.Font(name="Calibri", size=11, bold=True, color="1E3A8A")
+
+    # Fills
+    header_fill = openpyxl.styles.PatternFill(start_color="1E3A8A", end_color="1E3A8A", fill_type="solid")
+    working_hours_fill = openpyxl.styles.PatternFill(start_color="EFF6FF", end_color="EFF6FF", fill_type="solid")
+    off_day_header_fill = openpyxl.styles.PatternFill(start_color="F0FDFA", end_color="F0FDFA", fill_type="solid")
+    
+    date_col_fill = openpyxl.styles.PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
+    weekend_row_fill = openpyxl.styles.PatternFill(start_color="FEF2F2", end_color="FEF2F2", fill_type="solid")
+    
+    cell_off_fill = openpyxl.styles.PatternFill(start_color="E0F2FE", end_color="E0F2FE", fill_type="solid")
+    cell_absent_fill = openpyxl.styles.PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid")
+    cell_leave_fill = openpyxl.styles.PatternFill(start_color="FEF3C7", end_color="FEF3C7", fill_type="solid")
+    cell_holiday_fill = openpyxl.styles.PatternFill(start_color="DCFCE7", end_color="DCFCE7", fill_type="solid")
+    
+    summary_header_fill = openpyxl.styles.PatternFill(start_color="0F172A", end_color="0F172A", fill_type="solid")
+    summary_row_fill = openpyxl.styles.PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
+    summary_total_fill = openpyxl.styles.PatternFill(start_color="DBEAFE", end_color="DBEAFE", fill_type="solid")
+
+    # Status Fonts
+    status_off_font = openpyxl.styles.Font(name="Calibri", size=10, bold=True, color="0369A1")
+    status_absent_font = openpyxl.styles.Font(name="Calibri", size=10, bold=True, color="DC2626")
+    status_leave_font = openpyxl.styles.Font(name="Calibri", size=10, bold=True, color="B45309")
+    status_holiday_font = openpyxl.styles.Font(name="Calibri", size=10, bold=True, color="15803D")
+
+    # Borders
+    thin_border_side = openpyxl.styles.Side(style='thin', color='CBD5E1')
+    thin_border = openpyxl.styles.Border(
+        left=thin_border_side, right=thin_border_side, top=thin_border_side, bottom=thin_border_side
+    )
+    thick_bottom_side = openpyxl.styles.Side(style='medium', color='1E3A8A')
+    header_border = openpyxl.styles.Border(
+        left=thin_border_side, right=thin_border_side, top=thin_border_side, bottom=thick_bottom_side
+    )
+    double_bottom_side = openpyxl.styles.Side(style='double', color='1E3A8A')
+    total_border = openpyxl.styles.Border(
+        left=thin_border_side, right=thin_border_side, top=thin_border_side, bottom=double_bottom_side
+    )
+
+    # Alignments
+    center_align = openpyxl.styles.Alignment(horizontal='center', vertical='center', wrap_text=False)
+    left_align = openpyxl.styles.Alignment(horizontal='left', vertical='center')
+    right_align = openpyxl.styles.Alignment(horizontal='right', vertical='center')
+
     currency_fmt = '#,##0.00'
 
     employees = output_data['employees']
     matrix = output_data['matrix']
     summary = output_data['summary']
     emp_ids = [str(e['emp_id']) for e in employees]
+    num_cols = 2 + len(employees)
 
-    headers = ['Date', 'Weekday']
-    for emp in employees:
-        headers.append(f"{emp['name']} (In - Out)")
-    ws.append(headers)
-    for c in range(1, len(headers) + 1):
-        ws.cell(row=1, column=c).font = header_font
+    # 1. Report Title & Subtitle
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=num_cols)
+    title_cell = ws.cell(row=1, column=1, value="FDPP EMS — COMPREHENSIVE ATTENDANCE & PAYROLL REPORT")
+    title_cell.font = title_font
+    title_cell.alignment = left_align
+    ws.row_dimensions[1].height = 26
 
-    for row in matrix:
-        d = row['date']
-        date_str = d.strftime('%Y-%m-%d')
-        row_data = [date_str, row['weekday']]
-        for emp_id_str in emp_ids:
-            cell = row['cells'].get(emp_id_str, {})
-            status_val = cell.get('status', '')
-            if status_val == 'absent':
-                row_data.append('Absent')
-            elif status_val == 'leave':
-                lt = cell.get('leave_type', '')
-                row_data.append(f"Leave ({lt})" if lt else "Leave")
-            elif status_val == 'holiday':
-                hn = cell.get('holiday_name', '')
-                row_data.append(f"Holiday: {hn}" if hn else "Holiday")
-            elif status_val == 'off_day':
-                row_data.append('Off Day')
-            else:
-                in_str = cell.get('in_time') or '--:--'
-                out_str = cell.get('out_time') or '--:--'
-                val = f"{in_str} - {out_str}"
-                ot_h = cell.get('overtime_hours', 0)
-                if ot_h and float(ot_h) > 0:
-                    val += f" (OT:{ot_h}h)"
-                row_data.append(val)
-        ws.append(row_data)
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=num_cols)
+    subtitle_cell = ws.cell(
+        row=2, column=1,
+        value=f"Report Period: {start_date.strftime('%d %b %Y')} to {end_date.strftime('%d %b %Y')}   |   Generated: {datetime.now().strftime('%Y-%m-%d %I:%M %p')}"
+    )
+    subtitle_cell.font = subtitle_font
+    subtitle_cell.alignment = left_align
+    ws.row_dimensions[2].height = 20
 
-    summary_start = len(matrix) + 3
-    ws.cell(row=summary_start, column=1, value='METRIC').font = summary_font
+    # Row 3: Spacer
+    ws.row_dimensions[3].height = 8
+
+    # 2. Main Table Headers (Row 4)
+    row_4 = 4
+    ws.row_dimensions[row_4].height = 28
+    cell_date = ws.cell(row=row_4, column=1, value="Date")
+    cell_date.font = header_font
+    cell_date.fill = header_fill
+    cell_date.alignment = center_align
+    cell_date.border = header_border
+
+    cell_day = ws.cell(row=row_4, column=2, value="Weekday")
+    cell_day.font = header_font
+    cell_day.fill = header_fill
+    cell_day.alignment = center_align
+    cell_day.border = header_border
+
     for idx, emp in enumerate(employees):
-        col = 2 + idx * 2
-        ws.cell(row=summary_start, column=col, value=emp['name']).font = summary_font
-        ws.merge_cells(start_row=summary_start, start_column=col, end_row=summary_start, end_column=col + 1)
+        col = 3 + idx
+        emp_label = f"{emp['name']} (ID: {emp['emp_id']})"
+        cell = ws.cell(row=row_4, column=col, value=emp_label)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center_align
+        cell.border = header_border
+
+    # Row 5: Working Hours
+    row_5 = 5
+    ws.row_dimensions[row_5].height = 24
+    c_lbl1 = ws.cell(row=row_5, column=1, value="Working Hours")
+    c_lbl1.font = meta_label_font
+    c_lbl1.fill = working_hours_fill
+    c_lbl1.alignment = left_align
+    c_lbl1.border = thin_border
+
+    c_sub1 = ws.cell(row=row_5, column=2, value="(Shift Time)")
+    c_sub1.font = openpyxl.styles.Font(name="Calibri", size=9, italic=True, color="64748B")
+    c_sub1.fill = working_hours_fill
+    c_sub1.alignment = center_align
+    c_sub1.border = thin_border
+
+    for idx, emp in enumerate(employees):
+        col = 3 + idx
+        wh = emp.get('working_hours') or "No Shift Assigned"
+        cell = ws.cell(row=row_5, column=col, value=wh)
+        cell.font = meta_val_hours_font
+        cell.fill = working_hours_fill
+        cell.alignment = center_align
+        cell.border = thin_border
+
+    # Row 6: Weekly Off Day
+    row_6 = 6
+    ws.row_dimensions[row_6].height = 24
+    c_lbl2 = ws.cell(row=row_6, column=1, value="Weekly Off Day")
+    c_lbl2.font = meta_label_font
+    c_lbl2.fill = off_day_header_fill
+    c_lbl2.alignment = left_align
+    c_lbl2.border = thin_border
+
+    c_sub2 = ws.cell(row=row_6, column=2, value="(Rest Day)")
+    c_sub2.font = openpyxl.styles.Font(name="Calibri", size=9, italic=True, color="64748B")
+    c_sub2.fill = off_day_header_fill
+    c_sub2.alignment = center_align
+    c_sub2.border = thin_border
+
+    for idx, emp in enumerate(employees):
+        col = 3 + idx
+        off_day = emp.get('weekly_off_day_name') or "None"
+        cell = ws.cell(row=row_6, column=col, value=off_day)
+        cell.font = meta_val_off_font
+        cell.fill = off_day_header_fill
+        cell.alignment = center_align
+        cell.border = thin_border
+
+    # 3. Daily Attendance Matrix Rows
+    start_matrix_row = 7
+    current_row = start_matrix_row
+
+    for row_item in matrix:
+        d = row_item['date']
+        weekday_name = row_item['weekday']
+        is_weekend = weekday_name in ('Sunday', 'Saturday')
+        date_str = d.strftime('%Y-%m-%d')
+        
+        ws.row_dimensions[current_row].height = 22
+
+        # Date cell
+        c_date = ws.cell(row=current_row, column=1, value=date_str)
+        c_date.font = weekend_date_font if is_weekend else date_font
+        c_date.fill = weekend_row_fill if is_weekend else date_col_fill
+        c_date.alignment = center_align
+        c_date.border = thin_border
+
+        # Weekday cell
+        c_day = ws.cell(row=current_row, column=2, value=weekday_name)
+        c_day.font = weekend_date_font if is_weekend else date_font
+        c_day.fill = weekend_row_fill if is_weekend else date_col_fill
+        c_day.alignment = center_align
+        c_day.border = thin_border
+
+        for idx, emp_id_str in enumerate(emp_ids):
+            col = 3 + idx
+            cell_data = row_item['cells'].get(emp_id_str, {})
+            status_val = cell_data.get('status', '')
+            c_val = ws.cell(row=current_row, column=col)
+            c_val.border = thin_border
+            c_val.alignment = center_align
+
+            if status_val == 'off_day':
+                c_val.value = "Off Day"
+                c_val.font = status_off_font
+                c_val.fill = cell_off_fill
+            elif status_val == 'holiday':
+                hn = cell_data.get('holiday_name', '')
+                c_val.value = f"Holiday: {hn}" if hn else "Holiday"
+                c_val.font = status_holiday_font
+                c_val.fill = cell_holiday_fill
+            elif status_val == 'leave':
+                lt = cell_data.get('leave_type', '')
+                c_val.value = f"Leave ({lt.capitalize()})" if lt else "Leave"
+                c_val.font = status_leave_font
+                c_val.fill = cell_leave_fill
+            elif status_val == 'absent':
+                c_val.value = "Absent"
+                c_val.font = status_absent_font
+                c_val.fill = cell_absent_fill
+            else:
+                in_str = cell_data.get('in_time') or '--:--'
+                out_str = cell_data.get('out_time') or '--:--'
+                val = f"{in_str} - {out_str}"
+                
+                day_hours_str = cell_data.get('total_hours_display')
+                if day_hours_str and day_hours_str != "0h 0m":
+                    val += f" ({day_hours_str})"
+                elif cell_data.get('total_hours'):
+                    val += f" ({cell_data.get('total_hours')}h)"
+                
+                c_val.value = val
+                c_val.font = regular_font
+
+        current_row += 1
+
+    # 4. Summary & Metrics Section
+    summary_start_row = current_row + 2
+    ws.row_dimensions[summary_start_row - 1].height = 12
+
+    # Summary Section Header
+    ws.merge_cells(start_row=summary_start_row, start_column=1, end_row=summary_start_row, end_column=2)
+    s_hdr = ws.cell(row=summary_start_row, column=1, value="SUMMARY & PAYROLL BREAKDOWN")
+    s_hdr.font = summary_header_font
+    s_hdr.fill = summary_header_fill
+    s_hdr.alignment = left_align
+    s_hdr.border = header_border
+    ws.cell(row=summary_start_row, column=2).border = header_border
+
+    for idx, emp in enumerate(employees):
+        col = 3 + idx
+        c_emp_s = ws.cell(row=summary_start_row, column=col, value=emp['name'])
+        c_emp_s.font = summary_header_font
+        c_emp_s.fill = summary_header_fill
+        c_emp_s.alignment = center_align
+        c_emp_s.border = header_border
+    ws.row_dimensions[summary_start_row].height = 26
 
     summary_rows_data = [
-        ('Total Hours', 'total_hours', None),
-        ('Total Overtime', 'total_overtime_hours', None),
+        ('Total Hours Worked', 'total_hours', 'hours'),
+        ('Total Overtime Hours', 'total_overtime_hours', 'hours'),
         ('Days Present', 'days_present', 'int'),
         ('Days Absent', 'days_absent', 'int'),
-        ('Days Leave', 'days_leave', 'int'),
+        ('Days On Leave', 'days_leave', 'int'),
         ('Weekly Off Days', 'weekly_off_days', 'int'),
         ('Holiday Days', 'holiday_days', 'int'),
         ('Regular Pay', 'regular_pay', 'currency'),
@@ -2141,41 +2346,113 @@ def _build_excel_response(output_data, start_date, end_date):
         ('Holiday Pay', 'holiday_pay', 'currency'),
         ('Leave Pay', 'leave_pay', 'currency'),
         ('Off Day Pay', 'off_day_pay', 'currency'),
-        ('Total Salary', 'total_salary', 'currency'),
+        ('Total Calculated Salary', 'total_salary', 'total_currency'),
     ]
 
     for r_idx, (label, field, fmt_type) in enumerate(summary_rows_data):
-        row_num = summary_start + 1 + r_idx
-        ws.cell(row=row_num, column=1, value=label)
-        if label == 'Total Salary':
-            ws.cell(row=row_num, column=1).font = summary_font
+        r_num = summary_start_row + 1 + r_idx
+        ws.row_dimensions[r_num].height = 22
+        
+        is_total = (fmt_type == 'total_currency')
+
+        ws.merge_cells(start_row=r_num, start_column=1, end_row=r_num, end_column=2)
+        lbl_cell = ws.cell(row=r_num, column=1, value=label)
+        lbl_cell.font = summary_header_font if is_total else summary_label_font
+        lbl_cell.fill = summary_total_fill if is_total else summary_row_fill
+        lbl_cell.alignment = left_align
+        lbl_cell.border = total_border if is_total else thin_border
+        ws.cell(row=r_num, column=2).border = total_border if is_total else thin_border
+
         for e_idx, emp_id_str in enumerate(emp_ids):
+            col = 3 + e_idx
             emp_summary = summary.get(emp_id_str, {})
-            value = emp_summary.get(field, 0)
-            col = 2 + e_idx * 2
-            cell = ws.cell(row=row_num, column=col, value=value)
-            if fmt_type == 'currency':
-                cell.number_format = currency_fmt
-            ws.merge_cells(start_row=row_num, start_column=col, end_row=row_num, end_column=col + 1)
+            val = emp_summary.get(field, 0)
+            
+            val_cell = ws.cell(row=r_num, column=col)
+            val_cell.font = summary_header_font if is_total else summary_val_font
+            val_cell.fill = summary_total_fill if is_total else summary_row_fill
+            val_cell.border = total_border if is_total else thin_border
+            val_cell.alignment = right_align if 'currency' in fmt_type else center_align
 
-    gt_row = summary_start + 1 + len(summary_rows_data) + 1
+            if 'currency' in fmt_type:
+                val_cell.value = float(val) if val is not None else 0.0
+                val_cell.number_format = currency_fmt
+            elif fmt_type == 'int':
+                val_cell.value = int(val) if val is not None else 0
+            elif fmt_type == 'hours':
+                val_cell.value = f"{float(val):.2f} hrs" if val is not None else "0.00 hrs"
+            else:
+                val_cell.value = val
+
+    # 5. Grand Totals Box
+    gt_start_row = summary_start_row + 1 + len(summary_rows_data) + 1
+    ws.row_dimensions[gt_start_row - 1].height = 10
+
     gt = output_data['grand_totals']
-    ws.cell(row=gt_row, column=1, value='GRAND TOTALS').font = summary_font
-    gt_fields = [('Total Hours', 'total_hours'), ('Total OT', 'total_overtime_hours'), ('Total Salary', 'total_salary')]
-    for gt_idx, (gt_label, gt_field) in enumerate(gt_fields):
-        r = gt_row + 1 + gt_idx
-        ws.cell(row=r, column=1, value=gt_label).font = summary_font
-        last_col = 2 + (len(employees) - 1) * 2 + 1 if employees else 2
-        ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=last_col)
-        cell = ws.cell(row=r, column=2, value=gt[gt_field])
-        cell.font = summary_font
-        cell.alignment = openpyxl.styles.Alignment(horizontal='left')
+    ws.merge_cells(start_row=gt_start_row, start_column=1, end_row=gt_start_row, end_column=2)
+    gt_hdr = ws.cell(row=gt_start_row, column=1, value="COMPANY GRAND TOTALS")
+    gt_hdr.font = summary_header_font
+    gt_hdr.fill = summary_header_fill
+    gt_hdr.alignment = left_align
+    gt_hdr.border = header_border
+    ws.cell(row=gt_start_row, column=2).border = header_border
 
-    ws.column_dimensions['A'].width = 14
-    ws.column_dimensions['B'].width = 10
-    for i in range(len(employees)):
-        col_letter = get_column_letter(3 + i)
-        ws.column_dimensions[col_letter].width = 28
+    ws.merge_cells(start_row=gt_start_row, start_column=3, end_row=gt_start_row, end_column=num_cols)
+    gt_sub = ws.cell(row=gt_start_row, column=3, value=f"Total Active Employees Evaluated: {gt.get('total_employees', len(employees))}")
+    gt_sub.font = summary_header_font
+    gt_sub.fill = summary_header_fill
+    gt_sub.alignment = center_align
+    for c in range(3, num_cols + 1):
+        ws.cell(row=gt_start_row, column=c).border = header_border
+    ws.row_dimensions[gt_start_row].height = 26
+
+    gt_items = [
+        ('Grand Total Worked Hours', f"{gt.get('total_hours', 0):.2f} hrs"),
+        ('Grand Total Overtime Hours', f"{gt.get('total_overtime_hours', 0):.2f} hrs"),
+        ('Grand Total Payroll Budget', f"Rs {gt.get('total_salary', 0):,.2f}"),
+    ]
+
+    for g_idx, (gt_label, gt_value) in enumerate(gt_items):
+        g_row = gt_start_row + 1 + g_idx
+        ws.row_dimensions[g_row].height = 22
+
+        ws.merge_cells(start_row=g_row, start_column=1, end_row=g_row, end_column=2)
+        c_l = ws.cell(row=g_row, column=1, value=gt_label)
+        c_l.font = summary_label_font
+        c_l.fill = summary_row_fill
+        c_l.alignment = left_align
+        c_l.border = thin_border
+        ws.cell(row=g_row, column=2).border = thin_border
+
+        ws.merge_cells(start_row=g_row, start_column=3, end_row=g_row, end_column=num_cols)
+        c_v = ws.cell(row=g_row, column=3, value=gt_value)
+        c_v.font = grand_total_font
+        c_v.fill = summary_total_fill if g_idx == 2 else summary_row_fill
+        c_v.alignment = left_align
+        for c in range(3, num_cols + 1):
+            ws.cell(row=g_row, column=c).border = thin_border
+
+    # 6. Dynamic Auto-Fitting Column Dimensions based on actual data
+    for col_idx in range(1, num_cols + 1):
+        col_letter = get_column_letter(col_idx)
+        max_len = 0
+        for r_idx in range(4, ws.max_row + 1):
+            if r_idx in (1, 2, 3) or r_idx == summary_start_row or r_idx >= gt_start_row:
+                continue
+            if summary_start_row < r_idx < gt_start_row and col_idx == 2:
+                continue
+            cell = ws.cell(row=r_idx, column=col_idx)
+            if cell.value is not None:
+                val_str = str(cell.value)
+                if len(val_str) > max_len:
+                    max_len = len(val_str)
+
+        if col_idx == 1:
+            ws.column_dimensions[col_letter].width = max(max_len + 4, 16)
+        elif col_idx == 2:
+            ws.column_dimensions[col_letter].width = max(max_len + 4, 14)
+        else:
+            ws.column_dimensions[col_letter].width = max(max_len + 5, 26)
 
     output = BytesIO()
     wb.save(output)
@@ -2285,17 +2562,44 @@ class ComprehensiveReportView(APIView):
 
         employee_info_list = []
         for emp in employees_qs:
-            employee_info_list.append({
-                'emp_id': emp.emp_id,
-                'name': emp.name,
-                'designation': emp.designation,
-                'current_shift': {
+            shift_dict = None
+            working_hours_display = "No Shift Assigned"
+            if emp.current_shift:
+                st = emp.current_shift.start_time
+                et = emp.current_shift.end_time
+                st_str = st.strftime('%I:%M %p') if st else ''
+                et_str = et.strftime('%I:%M %p') if et else ''
+                
+                if st and et:
+                    st_dt = datetime.combine(date.today(), st)
+                    et_dt = datetime.combine(date.today(), et)
+                    if et <= st:
+                        et_dt += timedelta(days=1)
+                    s_hours = (et_dt - st_dt).total_seconds() / 3600
+                    working_hours_display = f"{st_str} - {et_str} ({s_hours:g} hrs)"
+                elif st_str and et_str:
+                    working_hours_display = f"{st_str} - {et_str}"
+                else:
+                    working_hours_display = emp.current_shift.name
+                
+                shift_dict = {
                     'id': emp.current_shift.id,
                     'name': emp.current_shift.name,
-                    'start_time': emp.current_shift.start_time,
-                    'end_time': emp.current_shift.end_time,
-                } if emp.current_shift else None,
+                    'start_time': st_str,
+                    'end_time': et_str,
+                    'working_hours': working_hours_display,
+                }
+            
+            off_day_display = emp.get_weekly_off_day_display() if emp.weekly_off_day is not None else "None"
+
+            employee_info_list.append({
+                'emp_id': emp.emp_id,
+                'name': emp.name or f"Emp {emp.emp_id}",
+                'designation': emp.designation or '',
+                'current_shift': shift_dict,
+                'working_hours': working_hours_display,
                 'weekly_off_day': emp.weekly_off_day,
+                'weekly_off_day_name': off_day_display,
                 'salary': emp.salary,
                 'hourly_rate': emp.hourly_rate,
             })
@@ -2372,10 +2676,16 @@ class ComprehensiveReportView(APIView):
 
                 in_str = in_time.strftime('%I:%M:%S %p') if in_time else None
                 out_str = out_time.strftime('%I:%M:%S %p') if out_time else None
+                
+                day_total_hours = float(att.total_hours) if att else 0.0
+                day_total_hours_display = format_hours_display(att.total_hours) if att else "0h 0m"
+
                 cells[str(emp_id)] = {
                     'in_time': in_str,
                     'out_time': out_str if out_str else (' --:-- ' if in_str else None),
                     'status': status_val,
+                    'total_hours': day_total_hours,
+                    'total_hours_display': day_total_hours_display,
                     'overtime_hours': round(ot_hours, 2),
                     'leave': on_leave,
                     'leave_type': leave_type,
