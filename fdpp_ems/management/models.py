@@ -3,7 +3,7 @@ from django.contrib.auth.models import User
 from django.utils import timezone
 from django.db.models.signals import pre_save, post_save
 from django.dispatch import receiver
-from datetime import timedelta, datetime
+from datetime import timedelta, datetime, time
 from django.conf import settings
 
 def get_current_date():
@@ -84,7 +84,7 @@ class Shift(models.Model):
         # to avoid triggering EmployeeShiftHistory.save auto-population.
         if is_update and (old_start != self.start_time or old_end != self.end_time):
             try:
-                # Only clear history times that match the old shift times —
+                # Only clear history times that match the old shift times -
                 # this preserves histories which intentionally override times.
                 q = EmployeeShiftHistory.objects.filter(shift=self)
                 if old_start is not None:
@@ -333,6 +333,30 @@ def get_employee_shift_times(employee, target_date=None):
     return (None, None)
 
 
+def get_duty_date_for_check_in(employee, check_in_dt, early_threshold_hours=None):
+    """Determine the logical duty date for a check-in event.
+    
+    If an employee arrives in the late evening (e.g., 20:00 - 23:59) for a shift
+    that starts at midnight or early morning the next day (e.g., 00:00 - 04:00 AM),
+    the attendance record is mapped to tomorrow's date (the shift's duty date).
+    """
+    if early_threshold_hours is None:
+        early_threshold_hours = getattr(settings, 'EARLY_CHECKIN_THRESHOLD_HOURS', 2.0)
+
+    cal_date = check_in_dt.date()
+    if check_in_dt.time() >= time(20, 0):
+        tomorrow = cal_date + timedelta(days=1)
+        s_start, _ = get_employee_shift_times(employee, tomorrow)
+        if s_start is not None and s_start <= time(4, 0):
+            shift_start_dt = datetime.combine(tomorrow, s_start)
+            if hasattr(check_in_dt, 'tzinfo') and check_in_dt.tzinfo is not None and timezone.is_aware(check_in_dt):
+                shift_start_dt = timezone.make_aware(shift_start_dt, check_in_dt.tzinfo)
+            diff_seconds = (shift_start_dt - check_in_dt).total_seconds()
+            if 0 <= diff_seconds <= early_threshold_hours * 3600:
+                return tomorrow
+    return cal_date
+
+
 # Grace period for lateness in minutes (configurable via Django settings)
 LATE_GRACE_MINUTES = getattr(settings, 'LATE_GRACE_MINUTES', 10)
 
@@ -459,14 +483,12 @@ class Attendance(models.Model):
     def is_late(self):
         if not self.check_in:
             return False
-        shift_entry = self.employee.get_shift_for_date(self.date)
-        if not shift_entry or not shift_entry.shift_start_time:
+        s_start, _ = get_employee_shift_times(self.employee, self.date)
+        if not s_start:
             return False
-        shift_start_time = shift_entry.shift_start_time
-        shift_start = datetime.combine(self.date, shift_start_time)
-        end_time = shift_entry.shift_end_time
-        if end_time and end_time <= shift_start_time and shift_start > self.check_in:
-            shift_start = shift_start - timedelta(days=1)
+        shift_start = datetime.combine(self.date, s_start)
+        if hasattr(self.check_in, 'tzinfo') and self.check_in.tzinfo is not None and timezone.is_aware(self.check_in):
+            shift_start = timezone.make_aware(shift_start, self.check_in.tzinfo)
         # Respect configured grace period
         return self.check_in > (shift_start + timedelta(minutes=LATE_GRACE_MINUTES))
 
@@ -508,3 +530,188 @@ class PaidLeave(models.Model):
     def duration_days(self):
         delta = self.end_time.date() - self.start_time.date()
         return delta.days + 1
+
+
+class ActivityLog(models.Model):
+    CATEGORY_CHOICES = [
+        ('auth', 'Authentication'),
+        ('employee', 'Employee Management'),
+        ('user', 'User Management'),
+        ('attendance', 'Attendance'),
+        ('leave', 'Leave Management'),
+        ('overtime', 'Overtime Management'),
+        ('shift', 'Shift Management'),
+        ('holiday', 'Holiday Management'),
+        ('salary', 'Salary / Payroll'),
+        ('other', 'Other'),
+    ]
+
+    ACTION_CHOICES = [
+        # Auth
+        ('login_success', 'Login Success'),
+        ('login_failed', 'Login Failed'),
+        ('logout', 'Logout'),
+        ('password_change', 'Password Changed'),
+        ('password_reset', 'Password Reset'),
+        ('register_user', 'User Registered'),
+        ('create_admin_manager', 'Admin/Manager Created'),
+
+        # Employee
+        ('employee_create', 'Employee Created'),
+        ('employee_update', 'Employee Updated'),
+        ('employee_deactivate', 'Employee Deactivated'),
+        ('employee_activate', 'Employee Activated'),
+        ('employee_delete', 'Employee Deleted'),
+
+        # User / Access Level
+        ('user_create', 'User Created'),
+        ('user_update', 'User Updated'),
+        ('user_delete', 'User Deleted'),
+        ('role_change', 'Role Changed'),
+
+        # Attendance
+        ('attendance_checkin', 'Attendance Check-In'),
+        ('attendance_checkout', 'Attendance Check-Out'),
+        ('attendance_manual_create', 'Manual Attendance Created'),
+        ('attendance_update', 'Attendance Updated'),
+        ('attendance_delete', 'Attendance Deleted'),
+
+        # Leave
+        ('leave_apply', 'Leave Applied'),
+        ('leave_approve', 'Leave Approved'),
+        ('leave_reject', 'Leave Rejected'),
+        ('leave_delete', 'Leave Deleted'),
+
+        # Overtime
+        ('overtime_create', 'Overtime Created'),
+        ('overtime_approve', 'Overtime Approved'),
+        ('overtime_reject', 'Overtime Rejected'),
+        ('overtime_delete', 'Overtime Deleted'),
+
+        # Shift
+        ('shift_create', 'Shift Created'),
+        ('shift_update', 'Shift Updated'),
+        ('shift_delete', 'Shift Deleted'),
+        ('shift_assign', 'Shift Assigned'),
+
+        # Holiday
+        ('holiday_create', 'Holiday Created'),
+        ('holiday_update', 'Holiday Updated'),
+        ('holiday_delete', 'Holiday Deleted'),
+
+        # Salary
+        ('salary_update', 'Salary Updated'),
+
+        ('other', 'Other Activity'),
+    ]
+
+    actor = models.ForeignKey(
+        User,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='activity_logs'
+    )
+    actor_username = models.CharField(max_length=150, null=True, blank=True)
+    actor_name = models.CharField(max_length=255, null=True, blank=True)
+    actor_role = models.CharField(max_length=50, null=True, blank=True)
+
+    action_type = models.CharField(max_length=50, choices=ACTION_CHOICES, db_index=True)
+    category = models.CharField(max_length=50, choices=CATEGORY_CHOICES, default='other', db_index=True)
+    description = models.TextField()
+
+    target_model = models.CharField(max_length=50, null=True, blank=True, db_index=True)
+    target_id = models.CharField(max_length=50, null=True, blank=True, db_index=True)
+    target_name = models.CharField(max_length=255, null=True, blank=True)
+
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    user_agent = models.TextField(null=True, blank=True)
+    details = models.JSONField(default=dict, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['category', '-created_at']),
+            models.Index(fields=['action_type', '-created_at']),
+            models.Index(fields=['actor_username', '-created_at']),
+            models.Index(fields=['target_model', 'target_id']),
+        ]
+        verbose_name = 'Activity Log'
+        verbose_name_plural = 'Activity Logs'
+
+    def __str__(self):
+        return f"[{self.created_at.strftime('%Y-%m-%d %H:%M:%S')}] {self.actor_username or 'System'} - {self.action_type}: {self.description[:50]}"
+
+
+def get_client_ip(request):
+    if not request:
+        return None
+    x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+    if x_forwarded_for:
+        ip = x_forwarded_for.split(',')[0].strip()
+    else:
+        ip = request.META.get('REMOTE_ADDR')
+    return ip
+
+
+def log_activity(
+    request=None,
+    actor=None,
+    action_type="other",
+    category="other",
+    description="",
+    target_model=None,
+    target_id=None,
+    target_name=None,
+    details=None
+):
+    """Utility to log activity anywhere across the application."""
+    import logging
+    try:
+        user = actor
+        if not user and request and hasattr(request, 'user') and request.user.is_authenticated:
+            user = request.user
+
+        actor_username = None
+        actor_name = None
+        actor_role = None
+
+        if user and hasattr(user, 'username'):
+            actor_username = user.username
+            actor_name = f"{user.first_name} {user.last_name}".strip() or user.username
+            try:
+                if hasattr(user, 'access_level'):
+                    actor_role = user.access_level.role
+                elif user.is_superuser:
+                    actor_role = 'admin'
+                elif hasattr(user, 'employee_profile'):
+                    actor_role = 'employee'
+            except Exception:
+                pass
+        elif request and hasattr(request, 'data') and request.data.get('username'):
+            actor_username = str(request.data.get('username'))
+
+        ip_addr = get_client_ip(request) if request else None
+        u_agent = request.META.get('HTTP_USER_AGENT', '') if request else None
+
+        return ActivityLog.objects.create(
+            actor=user if (user and hasattr(user, 'pk') and user.pk) else None,
+            actor_username=actor_username or 'System/Anonymous',
+            actor_name=actor_name or actor_username or 'System/Anonymous',
+            actor_role=actor_role or '',
+            action_type=action_type,
+            category=category,
+            description=description,
+            target_model=str(target_model) if target_model else None,
+            target_id=str(target_id) if target_id is not None else None,
+            target_name=str(target_name) if target_name else None,
+            ip_address=ip_addr,
+            user_agent=u_agent,
+            details=details or {},
+        )
+    except Exception as e:
+        logging.getLogger('management').error(f"Failed to log activity: {e}")
+        return None
+

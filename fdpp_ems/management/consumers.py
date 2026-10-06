@@ -6,7 +6,10 @@ import json
 from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.db import database_sync_to_async
 from django.db import close_old_connections
-from .models import Employee, Attendance, InactiveAttendanceAttempt, get_employee_shift_times, get_overtime_max_allowed
+from .models import (
+    Employee, Attendance, InactiveAttendanceAttempt,
+    get_employee_shift_times, get_overtime_max_allowed, get_duty_date_for_check_in
+)
 from datetime import datetime, timedelta
 from django.utils import timezone
 import logging
@@ -155,15 +158,13 @@ class BiometricConsumer(AsyncWebsocketConsumer):
             # Logic: Check-in or Check-out (mirror auto_attendance view)
             if not last_attendance or (last_attendance.check_out is not None):
                 # ===== NEW CHECK-IN =====
+                duty_date = get_duty_date_for_check_in(employee, now)
+                s_start, s_end = get_employee_shift_times(employee, duty_date)
+
                 is_late = False
                 late_msg = "On time"
                 if s_start:
-                    shift_start_dt = datetime.combine(today, s_start)
-                    # Adjust for overnight shifts
-                    if s_end and s_end <= s_start and shift_start_dt > now:
-                        if now.time() < s_end:
-                            shift_start_dt -= timedelta(days=1)
-
+                    shift_start_dt = datetime.combine(duty_date, s_start)
                     is_late = now > shift_start_dt + timedelta(minutes=LATE_GRACE_MINUTES)
                     if is_late:
                         total_minutes = int((now - shift_start_dt).total_seconds() / 60)
@@ -178,7 +179,7 @@ class BiometricConsumer(AsyncWebsocketConsumer):
 
                 Attendance.objects.create(
                     employee=employee,
-                    date=today,
+                    date=duty_date,
                     check_in=now,
                     message_late=late_msg,
                     status=status_val
@@ -206,15 +207,12 @@ class BiometricConsumer(AsyncWebsocketConsumer):
                     pass
                 max_allowed = get_overtime_max_allowed(employee, last_attendance.check_in)
                 if duration > max_allowed:
-                    # Do NOT auto-fill previous record's check_out; leave it open.
-                    # Create a new attendance record for the new check-in and return a check-in payload.
+                    duty_date_new = get_duty_date_for_check_in(employee, now)
+                    s_start_new, _ = get_employee_shift_times(employee, duty_date_new)
                     new_status = 'on_time'
-                    new_late_msg = None
-                    if s_start:
-                        new_shift_start = datetime.combine(now.date(), s_start)
-                        if s_end and s_end <= s_start and new_shift_start > now:
-                            if now.time() < s_end:
-                                new_shift_start -= timedelta(days=1)
+                    new_late_msg = "On time"
+                    if s_start_new:
+                        new_shift_start = datetime.combine(duty_date_new, s_start_new)
                         is_late_new = now > new_shift_start + timedelta(minutes=LATE_GRACE_MINUTES)
                         new_status = 'late' if is_late_new else 'on_time'
                         if is_late_new:
@@ -223,7 +221,7 @@ class BiometricConsumer(AsyncWebsocketConsumer):
 
                     new_att = Attendance.objects.create(
                         employee=employee,
-                        date=timezone.now().date(),
+                        date=duty_date_new,
                         check_in=now,
                         status=new_status,
                         message_late=new_late_msg
@@ -251,10 +249,10 @@ class BiometricConsumer(AsyncWebsocketConsumer):
                     if first_checkin:
                         total_duration = (now - first_checkin.check_in).total_seconds() / 3600
                         total_hours = round(min(total_duration, max_allowed), 2)
-                        # Auto overtime: hours worked after shift end
-                        if s_end:
-                            shift_end_dt = datetime.combine(today, s_end)
-                            if s_end <= s_start:
+                        s_start_co, s_end_co = get_employee_shift_times(employee, first_checkin.date)
+                        if s_end_co:
+                            shift_end_dt = datetime.combine(first_checkin.date, s_end_co)
+                            if s_start_co and s_end_co <= s_start_co:
                                 shift_end_dt += timedelta(days=1)
                             if now > shift_end_dt:
                                 ot_sec = (now - shift_end_dt).total_seconds()

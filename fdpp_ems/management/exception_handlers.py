@@ -1,4 +1,5 @@
 from rest_framework.views import exception_handler as drf_exception_handler
+from rest_framework.response import Response
 from rest_framework import status
 import logging
 
@@ -6,12 +7,8 @@ logger = logging.getLogger(__name__)
 
 
 def custom_exception_handler(exc, context):
-    """Custom DRF exception handler that produces friendlier 404 responses.
-
-    - Wraps DRF's default handler.
-    - When a 404/NotFound is returned, replace the default message with
-      a clearer hint about checking the endpoint and required parameters.
-    - Logs unhandled exceptions rather than masking them as 404.
+    """Custom DRF exception handler that produces friendlier 404 responses
+    and ensures CORS headers / JSON format are preserved on 500 errors.
     """
     response = drf_exception_handler(exc, context)
 
@@ -28,4 +25,7 @@ def custom_exception_handler(exc, context):
         return response
 
     logger.exception("Unhandled exception in API request: %s", exc)
-    return None
+    return Response(
+        {"error": f"Server Error: {str(exc)}"},
+        status=status.HTTP_500_INTERNAL_SERVER_ERROR
+    )

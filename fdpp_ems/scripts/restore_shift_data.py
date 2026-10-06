@@ -57,7 +57,7 @@ def run():
     for item in data:
         emp = Employee.objects.filter(id=item['id']).first()
         if not emp:
-            print(f"  ⚠ Employee id={item['id']} not found, skipping")
+            print(f"  [WARN] Employee id={item['id']} not found, skipping")
             continue
 
         shift_name = item.get('shift_type')

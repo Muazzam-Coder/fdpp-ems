@@ -3,6 +3,7 @@ from django.contrib.auth.models import User
 from .models import (
     Employee, Attendance, PaidLeave, Shift, UserAccessLevel,
     UserProfile, EmployeeShiftHistory, Holiday, Overtime, Salary,
+    ActivityLog,
     get_overtime_max_allowed, get_employee_shift_times,
 )
 from datetime import datetime, timedelta
@@ -24,19 +25,48 @@ def format_hours_display(hours_value):
 
 
 class UserSerializer(serializers.ModelSerializer):
+    username = serializers.CharField(max_length=150, required=True)
+    email = serializers.EmailField(required=False, allow_blank=True, allow_null=True)
+
     class Meta:
         model = User
         fields = ['id', 'username', 'email', 'first_name', 'last_name', 'password']
-        extra_kwargs = {'password': {'write_only': True}}
+        extra_kwargs = {
+            'password': {'write_only': True, 'required': False},
+            'username': {'required': True},
+            'email': {'required': False, 'allow_blank': True, 'allow_null': True}
+        }
+
+    def validate_username(self, value):
+        if not value or not str(value).strip():
+            raise serializers.ValidationError("Username is required.")
+        qs = User.objects.filter(username=value)
+        if self.instance:
+            qs = qs.exclude(pk=self.instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError("Username already exists.")
+        return value
+
+    def validate_email(self, value):
+        if not value or not str(value).strip():
+            return ""
+        qs = User.objects.filter(email=value)
+        if self.instance:
+            qs = qs.exclude(pk=self.instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError("Email already exists.")
+        return value
 
     def create(self, validated_data):
+        if 'email' not in validated_data or validated_data['email'] is None:
+            validated_data['email'] = ''
         user = User.objects.create_user(**validated_data)
         return user
 
 
 class RegisterSerializer(serializers.Serializer):
-    username = serializers.CharField(max_length=150)
-    email = serializers.EmailField()
+    username = serializers.CharField(max_length=150, required=True)
+    email = serializers.EmailField(required=False, allow_null=True, allow_blank=True)
     password = serializers.CharField(write_only=True, min_length=8)
     first_name = serializers.CharField(max_length=150, required=False, allow_null=True, allow_blank=True)
     last_name = serializers.CharField(max_length=150, required=False, allow_null=True, allow_blank=True)
@@ -58,11 +88,15 @@ class RegisterSerializer(serializers.Serializer):
     profile_img = serializers.ImageField(required=False, allow_null=True)
 
     def validate_username(self, value):
+        if not value or not str(value).strip():
+            raise serializers.ValidationError("Username is required.")
         if User.objects.filter(username=value).exists():
             raise serializers.ValidationError("Username already exists.")
         return value
 
     def validate_email(self, value):
+        if not value or not str(value).strip():
+            return ""
         if User.objects.filter(email=value).exists():
             raise serializers.ValidationError("Email already exists.")
         return value
@@ -77,10 +111,10 @@ class RegisterSerializer(serializers.Serializer):
     def create(self, validated_data):
         user_data = {
             'username': validated_data['username'],
-            'email': validated_data['email'],
+            'email': validated_data.get('email') or '',
             'password': validated_data['password'],
-            'first_name': validated_data.get('first_name', ''),
-            'last_name': validated_data.get('last_name', ''),
+            'first_name': validated_data.get('first_name', '') or '',
+            'last_name': validated_data.get('last_name', '') or '',
         }
         user = User.objects.create_user(**user_data)
 
@@ -132,16 +166,33 @@ class RegisterSerializer(serializers.Serializer):
 
 
 class UserAccessLevelSerializer(serializers.ModelSerializer):
-    username = serializers.CharField(source='user.username', read_only=True)
-    email = serializers.CharField(source='user.email', read_only=True)
-    first_name = serializers.CharField(source='user.first_name', read_only=True)
-    last_name = serializers.CharField(source='user.last_name', read_only=True)
+    user = serializers.PrimaryKeyRelatedField(read_only=True)
+    username = serializers.CharField(source='user.username', required=False)
+    email = serializers.CharField(source='user.email', required=False, allow_null=True, allow_blank=True)
+    first_name = serializers.CharField(source='user.first_name', required=False, allow_null=True, allow_blank=True)
+    last_name = serializers.CharField(source='user.last_name', required=False, allow_null=True, allow_blank=True)
+    password = serializers.CharField(write_only=True, required=False, allow_null=True, allow_blank=True, min_length=8)
     profile_img = serializers.SerializerMethodField()
+
+    address = serializers.CharField(required=False, allow_null=True, allow_blank=True, write_only=True)
+    r_address = serializers.CharField(required=False, allow_null=True, allow_blank=True, write_only=True)
+    r_phone = serializers.CharField(required=False, allow_null=True, allow_blank=True, write_only=True)
+    relative = serializers.CharField(required=False, allow_null=True, allow_blank=True, write_only=True)
+    phone = serializers.CharField(required=False, allow_null=True, allow_blank=True, write_only=True)
+    CNIC = serializers.CharField(required=False, allow_null=True, allow_blank=True, write_only=True)
+    designation = serializers.CharField(required=False, allow_null=True, allow_blank=True, write_only=True)
+    start_time = serializers.TimeField(required=False, allow_null=True, write_only=True)
+    end_time = serializers.TimeField(required=False, allow_null=True, write_only=True)
 
     class Meta:
         model = UserAccessLevel
-        fields = ['id', 'user', 'username', 'email', 'first_name', 'last_name', 'profile_img', 'role', 'created_at', 'updated_at']
-        read_only_fields = ['created_at', 'updated_at']
+        fields = [
+            'id', 'user', 'username', 'email', 'first_name', 'last_name', 'password',
+            'profile_img', 'role', 'address', 'r_address', 'r_phone', 'relative',
+            'phone', 'CNIC', 'designation', 'start_time', 'end_time',
+            'created_at', 'updated_at'
+        ]
+        read_only_fields = ['user', 'created_at', 'updated_at']
 
     def get_profile_img(self, obj):
         try:
@@ -164,22 +215,75 @@ class UserAccessLevelSerializer(serializers.ModelSerializer):
 
         return None
 
+    def update(self, instance, validated_data):
+        user_data = validated_data.pop('user', {})
+        password = validated_data.pop('password', None)
+        
+        emp_fields = {}
+        for field in ['address', 'r_address', 'r_phone', 'relative', 'phone', 'CNIC', 'designation', 'start_time', 'end_time']:
+            if field in validated_data:
+                emp_fields[field] = validated_data.pop(field)
+
+        user = instance.user
+
+        if 'username' in user_data:
+            new_username = str(user_data['username'] or '').strip()
+            if not new_username:
+                raise serializers.ValidationError({"username": "Username is required."})
+            if User.objects.filter(username=new_username).exclude(pk=user.pk).exists():
+                raise serializers.ValidationError({"username": "Username already exists."})
+            user.username = new_username
+
+        if 'email' in user_data:
+            new_email = str(user_data['email'] or '').strip()
+            if new_email and User.objects.filter(email=new_email).exclude(pk=user.pk).exists():
+                raise serializers.ValidationError({"email": "Email already exists."})
+            user.email = new_email
+
+        if 'first_name' in user_data:
+            user.first_name = user_data['first_name'] or ''
+        if 'last_name' in user_data:
+            user.last_name = user_data['last_name'] or ''
+        if password:
+            user.set_password(password)
+        user.save()
+
+        try:
+            if hasattr(user, 'employee_profile') and user.employee_profile:
+                emp = user.employee_profile
+                for k, v in emp_fields.items():
+                    if hasattr(emp, k) and v is not None:
+                        setattr(emp, k, v)
+                if 'first_name' in user_data or 'last_name' in user_data:
+                    full_name = f"{user.first_name} {user.last_name}".strip()
+                    if full_name:
+                        emp.name = full_name
+                emp.save()
+        except (AttributeError, Employee.DoesNotExist):
+            pass
+
+        return super().update(instance, validated_data)
+
 
 class CreateAdminManagerSerializer(serializers.Serializer):
-    username = serializers.CharField(max_length=150)
-    email = serializers.EmailField()
+    username = serializers.CharField(max_length=150, required=True)
+    email = serializers.EmailField(required=False, allow_null=True, allow_blank=True)
     password = serializers.CharField(write_only=True, min_length=8)
-    first_name = serializers.CharField(max_length=150, required=False)
-    last_name = serializers.CharField(max_length=150, required=False)
+    first_name = serializers.CharField(max_length=150, required=False, allow_null=True, allow_blank=True)
+    last_name = serializers.CharField(max_length=150, required=False, allow_null=True, allow_blank=True)
     role = serializers.ChoiceField(choices=['admin', 'manager'], default='manager')
     profile_img = serializers.ImageField(required=False, allow_null=True)
 
     def validate_username(self, value):
+        if not value or not str(value).strip():
+            raise serializers.ValidationError("Username is required.")
         if User.objects.filter(username=value).exists():
             raise serializers.ValidationError("Username already exists.")
         return value
 
     def validate_email(self, value):
+        if not value or not str(value).strip():
+            return ""
         if User.objects.filter(email=value).exists():
             raise serializers.ValidationError("Email already exists.")
         return value
@@ -187,6 +291,8 @@ class CreateAdminManagerSerializer(serializers.Serializer):
     def create(self, validated_data):
         role = validated_data.pop('role')
         profile_img = validated_data.pop('profile_img', None)
+        if 'email' not in validated_data or validated_data['email'] is None:
+            validated_data['email'] = ''
 
         user = User.objects.create_user(**validated_data)
         UserAccessLevel.objects.update_or_create(user=user, defaults={'role': role})
@@ -197,6 +303,37 @@ class CreateAdminManagerSerializer(serializers.Serializer):
             UserProfile.objects.create(user=user)
 
         return user
+
+
+class ChangePasswordSerializer(serializers.Serializer):
+    old_password = serializers.CharField(required=False, write_only=True, allow_null=True, allow_blank=True)
+    new_password = serializers.CharField(required=True, write_only=True, min_length=8)
+    confirm_password = serializers.CharField(required=False, write_only=True, min_length=8, allow_null=True, allow_blank=True)
+    user_id = serializers.IntegerField(required=False, allow_null=True)
+    emp_id = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    username = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+
+    def validate(self, data):
+        new_pwd = data.get('new_password')
+        confirm_pwd = data.get('confirm_password')
+        if confirm_pwd and new_pwd != confirm_pwd:
+            raise serializers.ValidationError({"confirm_password": "Passwords do not match."})
+        return data
+
+
+class AdminSetPasswordSerializer(serializers.Serializer):
+    password = serializers.CharField(required=False, write_only=True, min_length=8, allow_null=True, allow_blank=True)
+    new_password = serializers.CharField(required=False, write_only=True, min_length=8, allow_null=True, allow_blank=True)
+    user_id = serializers.IntegerField(required=False, allow_null=True)
+    emp_id = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    username = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+
+    def validate(self, data):
+        pwd = data.get('new_password') or data.get('password')
+        if not pwd or len(str(pwd)) < 8:
+            raise serializers.ValidationError({"password": "Password must be at least 8 characters long."})
+        data['resolved_password'] = str(pwd)
+        return data
 
 
 class ShiftSerializer(serializers.ModelSerializer):
@@ -221,8 +358,8 @@ class EmployeeShiftHistorySerializer(serializers.ModelSerializer):
 
 class EmployeeSerializer(serializers.ModelSerializer):
     total_hours_today = serializers.ReadOnlyField()
-    username = serializers.CharField(source='user.username', read_only=True, allow_null=True)
-    email = serializers.CharField(source='user.email', read_only=True, allow_null=True)
+    username = serializers.CharField(source='user.username', required=False, allow_null=True, allow_blank=True)
+    email = serializers.CharField(source='user.email', required=False, allow_null=True, allow_blank=True)
     profile_img = serializers.ImageField(required=False, allow_null=True)
     designation = serializers.CharField(required=False, allow_null=True, allow_blank=True)
     referance = serializers.CharField(required=False, allow_null=True, allow_blank=True)
@@ -263,10 +400,11 @@ class EmployeeSerializer(serializers.ModelSerializer):
             'address', 'phone', 'CNIC', 'relative', 'r_phone', 'r_address',
             'status', 'date_joined', 'last_modified', 'total_hours_today', 'referance', 'relatives'
         ]
-        read_only_fields = ['emp_id', 'username', 'email', 'last_modified']
+        read_only_fields = ['emp_id', 'last_modified']
 
     def create(self, validated_data):
         relatives = validated_data.pop('relatives', [])
+        user_data = validated_data.pop('user', {})
         employee = super().create(validated_data)
         if relatives:
             relatives = [r for r in relatives if r is not None]
@@ -275,6 +413,23 @@ class EmployeeSerializer(serializers.ModelSerializer):
         return employee
 
     def update(self, instance, validated_data):
+        user_data = validated_data.pop('user', {})
+        if instance.user and user_data:
+            user = instance.user
+            if 'username' in user_data:
+                new_username = str(user_data['username'] or '').strip()
+                if not new_username:
+                    raise serializers.ValidationError({"username": "Username cannot be empty."})
+                if User.objects.filter(username=new_username).exclude(pk=user.pk).exists():
+                    raise serializers.ValidationError({"username": "Username already exists."})
+                user.username = new_username
+            if 'email' in user_data:
+                new_email = str(user_data['email'] or '').strip()
+                if new_email and User.objects.filter(email=new_email).exclude(pk=user.pk).exists():
+                    raise serializers.ValidationError({"email": "Email already exists."})
+                user.email = new_email
+            user.save()
+
         relatives = validated_data.pop('relatives', None)
         instance = super().update(instance, validated_data)
         if relatives is not None:
@@ -480,3 +635,37 @@ class ComprehensiveReportInputSerializer(serializers.Serializer):
         if (attrs['end_date'] - attrs['start_date']).days > 90:
             raise serializers.ValidationError("Date range cannot exceed 90 days")
         return attrs
+
+
+class ActivityLogSerializer(serializers.ModelSerializer):
+    category_display = serializers.CharField(source='get_category_display', read_only=True)
+    action_type_display = serializers.CharField(source='get_action_type_display', read_only=True)
+    formatted_created_at = serializers.SerializerMethodField()
+    ip_address = serializers.CharField(required=False, allow_null=True, allow_blank=True, read_only=True)
+
+    class Meta:
+        model = ActivityLog
+        fields = [
+            'id', 'actor', 'actor_username', 'actor_name', 'actor_role',
+            'action_type', 'action_type_display',
+            'category', 'category_display',
+            'description',
+            'target_model', 'target_id', 'target_name',
+            'ip_address', 'user_agent', 'details',
+            'created_at', 'formatted_created_at'
+        ]
+        read_only_fields = [
+            'id', 'actor', 'actor_username', 'actor_name', 'actor_role',
+            'action_type', 'action_type_display',
+            'category', 'category_display',
+            'description',
+            'target_model', 'target_id', 'target_name',
+            'ip_address', 'user_agent', 'details',
+            'created_at', 'formatted_created_at'
+        ]
+
+    def get_formatted_created_at(self, obj):
+        if not obj.created_at:
+            return ""
+        return obj.created_at.strftime('%Y-%m-%d %I:%M:%S %p')
+

@@ -26,16 +26,16 @@ RED = '\033[91m'
 RESET = '\033[0m'
 
 def print_success(msg):
-    print(f"{GREEN}✅ {msg}{RESET}")
+    print(f"{GREEN}[SUCCESS] {msg}{RESET}")
 
 def print_info(msg):
-    print(f"{BLUE}ℹ️  {msg}{RESET}")
+    print(f"{BLUE}[INFO] {msg}{RESET}")
 
 def print_warning(msg):
-    print(f"{YELLOW}⚠️  {msg}{RESET}")
+    print(f"{YELLOW}[WARNING] {msg}{RESET}")
 
 def print_error(msg):
-    print(f"{RED}❌ {msg}{RESET}")
+    print(f"{RED}[ERROR] {msg}{RESET}")
 
 def create_shifts():
     """Create sample shifts"""
@@ -304,7 +304,7 @@ def create_leave():
         )
         
         if created:
-            status = "✓ Approved" if leave.approved else "⏳ Pending"
+            status = "Approved" if leave.approved else "Pending"
             print_success(f"{employee.name} - {leave_type} leave ({status})")
         else:
             print_info(f"Already exists: {employee.name} leave request")
@@ -414,7 +414,7 @@ def display_summary():
     print_info("GET /api/shifts/ - List shifts")
     
     print(f"\n{GREEN}{'='*60}")
-    print("✅ SEED DATA CREATION COMPLETE!")
+    print("[SUCCESS] SEED DATA CREATION COMPLETE!")
     print(f"{'='*60}{RESET}")
 
 def main():

@@ -44,7 +44,7 @@ load_env_file(BASE_DIR.parent / '.env')
 SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-(p2krps2z*kc$0s1_ink@4)0&@e$m=yg(ulhe(ekecznw580#s')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = False
+DEBUG = True
 
 SERVER_IP = os.environ['SERVER_IP']
 SERVER_PORT = int(os.environ['SERVER_PORT'])
@@ -74,9 +74,9 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'whitenoise.middleware.WhiteNoiseMiddleware',
-    'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -232,3 +232,28 @@ APPEND_SLASH = False
 # CORS Configuration - Allow all origins for development
 CORS_ALLOW_ALL_ORIGINS = True
 CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOW_METHODS = [
+    "DELETE",
+    "GET",
+    "OPTIONS",
+    "PATCH",
+    "POST",
+    "PUT",
+]
+CORS_ALLOW_HEADERS = [
+    "accept",
+    "accept-encoding",
+    "authorization",
+    "content-type",
+    "dnt",
+    "origin",
+    "user-agent",
+    "x-csrftoken",
+    "x-requested-with",
+    "*",
+]
+CORS_EXPOSE_HEADERS = ["*"]
+
+# Attendance Grace Period & Early Check-In Settings
+LATE_GRACE_MINUTES = 10
+EARLY_CHECKIN_THRESHOLD_HOURS = 2.0

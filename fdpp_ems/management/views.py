@@ -7,19 +7,23 @@ from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.pagination import PageNumberPagination
 from django_filters import rest_framework as filters
+from django.contrib.auth.models import User
 from .models import (
     Employee, Attendance, PaidLeave, Shift, UserAccessLevel,
     InactiveAttendanceAttempt, EmployeeShiftHistory, Holiday, Overtime,
     Salary, get_employee_shift_times, get_overtime_max_allowed,
-    get_salary_for_date
+    get_salary_for_date, get_duty_date_for_check_in,
+    ActivityLog, log_activity
 )
 from .serializers import (
     EmployeeSerializer, AttendanceSerializer, PaidLeaveSerializer, 
     ShiftSerializer, UserAccessLevelSerializer,
     CreateAdminManagerSerializer, RegisterSerializer,
+    ChangePasswordSerializer, AdminSetPasswordSerializer,
     EmployeeShiftHistorySerializer, HolidaySerializer, OvertimeSerializer,
     SalarySerializer,
     ComprehensiveReportInputSerializer,
+    ActivityLogSerializer,
 )
 from django.db.models import Q
 from datetime import datetime, timedelta, date, time
@@ -44,10 +48,15 @@ LATE_GRACE_MINUTES = getattr(settings, 'LATE_GRACE_MINUTES', 10)
 # Permission check: Only admins can create admin/manager
 def is_admin(user):
     """Check if user has admin role"""
+    if getattr(user, 'is_superuser', False):
+        return True
     try:
         return user.access_level.role == 'admin'
     except (AttributeError, UserAccessLevel.DoesNotExist):
         return False
+
+
+WEEKDAY_NAMES = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
 
 
 def format_hours_display(hours_value):
@@ -57,6 +66,266 @@ def format_hours_display(hours_value):
     total_minutes = max(0, int(round(float(hours_value) * 60)))
     hours, minutes = divmod(total_minutes, 60)
     return f'{hours}h {minutes}m'
+
+
+def parse_date_range_params(request):
+    """Helper to parse date or start_date/end_date (or date_from/date_to) query params.
+    Returns (start_date, end_date, error_message).
+    """
+    date_str = request.query_params.get('date')
+    start_str = request.query_params.get('start_date') or request.query_params.get('date_from')
+    end_str = request.query_params.get('end_date') or request.query_params.get('date_to')
+
+    if date_str:
+        try:
+            d = datetime.strptime(date_str, '%Y-%m-%d').date()
+            return d, d, None
+        except ValueError:
+            return None, None, "Invalid date format. Use YYYY-MM-DD"
+
+    if start_str or end_str:
+        if not start_str or not end_str:
+            return None, None, "Please provide both start_date and end_date (YYYY-MM-DD)"
+        try:
+            s_date = datetime.strptime(start_str, '%Y-%m-%d').date()
+            e_date = datetime.strptime(end_str, '%Y-%m-%d').date()
+            if s_date > e_date:
+                return None, None, "start_date cannot be after end_date"
+            return s_date, e_date, None
+        except ValueError:
+            return None, None, "Invalid date format. Use YYYY-MM-DD"
+
+    # Default to current month: 1st of current month to today (or end of month)
+    today = timezone.now().date()
+    s_date = date(today.year, today.month, 1)
+    if today.month == 12:
+        e_date = date(today.year + 1, 1, 1) - timedelta(days=1)
+    else:
+        e_date = date(today.year, today.month + 1, 1) - timedelta(days=1)
+    return s_date, e_date, None
+
+
+def build_employee_detailed_logs(employee, start_date, end_date):
+    """Generate detailed breakdown of all punch sessions and daily summaries for an employee."""
+    attendances = Attendance.objects.filter(
+        employee=employee,
+        date__range=[start_date, end_date]
+    ).order_by('date', 'check_in')
+
+    att_map = {}
+    for att in attendances:
+        att_map.setdefault(att.date, []).append(att)
+
+    leaves = PaidLeave.objects.filter(
+        employee=employee,
+        approved=True,
+        start_time__date__lte=end_date,
+        end_time__date__gte=start_date
+    )
+    holidays = {h.date: h for h in Holiday.objects.filter(date__range=[start_date, end_date])}
+    overtimes = {o.date: o for o in Overtime.objects.filter(employee=employee, date__range=[start_date, end_date], status='approved')}
+
+    shift_info = None
+    if employee.current_shift:
+        st = employee.current_shift.start_time
+        et = employee.current_shift.end_time
+        st_str = st.strftime('%I:%M %p') if st else ''
+        et_str = et.strftime('%I:%M %p') if et else ''
+        shift_info = {
+            "id": employee.current_shift.id,
+            "name": employee.current_shift.name,
+            "start_time": st_str,
+            "end_time": et_str,
+            "working_hours": f"{st_str} - {et_str}" if (st_str and et_str) else employee.current_shift.name
+        }
+
+    daily_logs = []
+    curr = start_date
+    total_worked_hours = 0.0
+    total_sessions_count = 0
+    days_present = 0
+    days_absent = 0
+    days_leave = 0
+    days_off = 0
+    days_holiday = 0
+    late_arrivals_count = 0
+    today = timezone.now().date()
+    current_time = datetime.now().time()
+
+    while curr <= end_date:
+        weekday_idx = curr.weekday()
+        weekday_name = curr.strftime('%A')
+        is_off = (employee.weekly_off_day is not None and weekday_idx == employee.weekly_off_day)
+        holiday = holidays.get(curr)
+        ot_rec = overtimes.get(curr)
+
+        leave_rec = None
+        for lv in leaves:
+            if lv.start_time.date() <= curr <= lv.end_time.date():
+                leave_rec = lv
+                break
+
+        day_atts = att_map.get(curr, [])
+        sessions_data = []
+
+        if day_atts:
+            days_present += 1
+            total_sessions_count += len(day_atts)
+            first_att = day_atts[0]
+            last_att = day_atts[-1]
+
+            first_in = first_att.check_in.strftime('%I:%M:%S %p') if first_att.check_in else None
+            last_out = last_att.check_out.strftime('%I:%M:%S %p') if last_att.check_out else None
+
+            day_hours = round(sum(a.total_hours for a in day_atts), 2)
+            total_worked_hours += day_hours
+
+            is_late_day = any(a.status == 'late' for a in day_atts)
+            if is_late_day:
+                late_arrivals_count += 1
+            status_val = 'late' if is_late_day else 'on_time'
+
+            for a in day_atts:
+                sessions_data.append({
+                    "id": a.id,
+                    "check_in": a.check_in.isoformat() if a.check_in else None,
+                    "check_in_formatted": a.check_in.strftime('%I:%M:%S %p') if a.check_in else None,
+                    "check_out": a.check_out.isoformat() if a.check_out else None,
+                    "check_out_formatted": a.check_out.strftime('%I:%M:%S %p') if a.check_out else "--:--",
+                    "total_hours": format_hours_display(a.total_hours),
+                    "total_hours_value": float(a.total_hours),
+                    "status": a.status,
+                    "message_late": a.message_late,
+                    "is_late": a.is_late,
+                })
+
+            daily_logs.append({
+                "date": curr.isoformat(),
+                "day_of_week": weekday_name,
+                "status": status_val,
+                "first_check_in": first_in,
+                "last_check_out": last_out if last_out else "--:--",
+                "total_hours": format_hours_display(day_hours),
+                "total_hours_value": day_hours,
+                "total_sessions": len(day_atts),
+                "is_late": is_late_day,
+                "late_message": first_att.message_late or ("Late arrival" if is_late_day else "On time"),
+                "overtime_hours": float(ot_rec.total_hours) if ot_rec else 0.0,
+                "sessions": sessions_data
+            })
+        elif leave_rec:
+            days_leave += 1
+            daily_logs.append({
+                "date": curr.isoformat(),
+                "day_of_week": weekday_name,
+                "status": "on_leave",
+                "first_check_in": None,
+                "last_check_out": None,
+                "total_hours": "0h 0m",
+                "total_hours_value": 0.0,
+                "total_sessions": 0,
+                "is_late": False,
+                "late_message": f"Leave ({leave_rec.get_leave_type_display()})",
+                "overtime_hours": 0.0,
+                "sessions": []
+            })
+        elif holiday:
+            days_holiday += 1
+            daily_logs.append({
+                "date": curr.isoformat(),
+                "day_of_week": weekday_name,
+                "status": "holiday",
+                "first_check_in": None,
+                "last_check_out": None,
+                "total_hours": "0h 0m",
+                "total_hours_value": 0.0,
+                "total_sessions": 0,
+                "is_late": False,
+                "late_message": f"Holiday ({holiday.name})",
+                "overtime_hours": 0.0,
+                "sessions": []
+            })
+        elif is_off:
+            days_off += 1
+            daily_logs.append({
+                "date": curr.isoformat(),
+                "day_of_week": weekday_name,
+                "status": "off_day",
+                "first_check_in": None,
+                "last_check_out": None,
+                "total_hours": "0h 0m",
+                "total_hours_value": 0.0,
+                "total_sessions": 0,
+                "is_late": False,
+                "late_message": "Weekly Off Day",
+                "overtime_hours": 0.0,
+                "sessions": []
+            })
+        else:
+            s_start, s_end = get_employee_shift_times(employee, curr)
+            is_past = (curr < today) or (curr == today and s_end and current_time >= s_end)
+            if is_past:
+                days_absent += 1
+                status_str = "absent"
+                msg = "Absent"
+            else:
+                status_str = "pending"
+                msg = "Shift not started yet" if (curr == today) else "Upcoming"
+
+            daily_logs.append({
+                "date": curr.isoformat(),
+                "day_of_week": weekday_name,
+                "status": status_str,
+                "first_check_in": None,
+                "last_check_out": None,
+                "total_hours": "0h 0m",
+                "total_hours_value": 0.0,
+                "total_sessions": 0,
+                "is_late": False,
+                "late_message": msg,
+                "overtime_hours": 0.0,
+                "sessions": []
+            })
+
+        curr += timedelta(days=1)
+
+    total_worked_hours = round(total_worked_hours, 2)
+    hourly_rate = float(employee.hourly_rate or 0)
+    estimated_pay = round(total_worked_hours * hourly_rate, 2)
+
+    return {
+        "employee": {
+            "id": employee.id,
+            "emp_id": employee.emp_id,
+            "name": employee.name,
+            "designation": employee.designation,
+            "status": employee.status,
+            "current_shift": shift_info,
+            "weekly_off_day": employee.weekly_off_day,
+            "weekly_off_day_name": employee.get_weekly_off_day_display() if employee.weekly_off_day is not None else "None",
+            "salary": float(employee.salary or 0),
+            "hourly_rate": hourly_rate,
+        },
+        "period": {
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "total_calendar_days": (end_date - start_date).days + 1
+        },
+        "summary": {
+            "present_days": days_present,
+            "absent_days": days_absent,
+            "leave_days": days_leave,
+            "off_days": days_off,
+            "holiday_days": days_holiday,
+            "total_sessions": total_sessions_count,
+            "total_hours": format_hours_display(total_worked_hours),
+            "total_hours_value": total_worked_hours,
+            "late_arrivals": late_arrivals_count,
+            "hourly_rate": hourly_rate,
+            "estimated_pay": estimated_pay
+        },
+        "daily_logs": daily_logs
+    }
 
 
 
@@ -151,6 +420,18 @@ class AuthViewSet(viewsets.ViewSet):
             user = result['user']
             employee = result['employee']
             
+            log_activity(
+                request=request,
+                actor=user,
+                action_type='register_user',
+                category='auth',
+                description=f"User registered: '{user.username}' (Employee ID: {employee.emp_id}, Name: {employee.name})",
+                target_model='Employee',
+                target_id=employee.emp_id,
+                target_name=employee.name,
+                details={'username': user.username, 'email': user.email, 'emp_id': employee.emp_id}
+            )
+
             return Response({
                 "message": "User registered successfully",
                 "user": {
@@ -180,16 +461,29 @@ class AuthViewSet(viewsets.ViewSet):
         serializer = CreateAdminManagerSerializer(data=request.data)
         if serializer.is_valid():
             user = serializer.save()
-            
+            role_val = serializer.validated_data['role']
+
+            log_activity(
+                request=request,
+                actor=request.user,
+                action_type='create_admin_manager',
+                category='auth',
+                description=f"Admin/Manager '{user.username}' created with role '{role_val}' by '{request.user.username}'",
+                target_model='User',
+                target_id=user.id,
+                target_name=user.username,
+                details={'role': role_val, 'username': user.username, 'email': user.email}
+            )
+
             response_data = {
-                "message": f"User created successfully as {serializer.validated_data['role']}",
+                "message": f"User created successfully as {role_val}",
                 "user": {
                     "id": user.id,
                     "username": user.username,
                     "email": user.email,
                     "first_name": user.first_name,
                     "last_name": user.last_name,
-                    "role": serializer.validated_data['role'],
+                    "role": role_val,
                     "profile_img": None
                 }
             }
@@ -217,6 +511,18 @@ class AuthViewSet(viewsets.ViewSet):
             try:
                 # Fetch access level directly from database to get latest data
                 access_level = UserAccessLevel.objects.get(user=user)
+                role = access_level.role
+                log_activity(
+                    request=request,
+                    actor=user,
+                    action_type='login_success',
+                    category='auth',
+                    description=f"User '{user.username}' logged in successfully as {role}",
+                    target_model='User',
+                    target_id=user.id,
+                    target_name=user.username,
+                    details={'role': role, 'user_id': user.id}
+                )
                 return Response({
                     "message": "Login successful",
                     "user_id": user.id,
@@ -224,12 +530,23 @@ class AuthViewSet(viewsets.ViewSet):
                     "email": user.email,
                     "first_name": user.first_name,
                     "last_name": user.last_name,
-                    "role": access_level.role
+                    "role": role
                 }, status=status.HTTP_200_OK)
             except UserAccessLevel.DoesNotExist:
                 # Try to get employee profile if user has one
                 try:
                     employee = user.employee_profile
+                    log_activity(
+                        request=request,
+                        actor=user,
+                        action_type='login_success',
+                        category='auth',
+                        description=f"Employee user '{user.username}' ({employee.name}) logged in successfully",
+                        target_model='Employee',
+                        target_id=employee.emp_id,
+                        target_name=employee.name,
+                        details={'role': 'employee', 'emp_id': employee.emp_id, 'user_id': user.id}
+                    )
                     return Response({
                         "message": "Login successful",
                         "user_id": user.id,
@@ -242,22 +559,225 @@ class AuthViewSet(viewsets.ViewSet):
                         "role": "employee"
                     }, status=status.HTTP_200_OK)
                 except Employee.DoesNotExist:
+                    log_activity(
+                        request=request,
+                        actor=user,
+                        action_type='login_failed',
+                        category='auth',
+                        description=f"Login failed: User '{user.username}' has no active profile",
+                        target_model='User',
+                        target_id=user.id,
+                        target_name=user.username,
+                        details={'username': user.username, 'reason': 'No profile associated'}
+                    )
                     return Response(
                         {"error": "User profile not found"},
                         status=status.HTTP_404_NOT_FOUND
                     )
+        
+        log_activity(
+            request=request,
+            actor=None,
+            action_type='login_failed',
+            category='auth',
+            description=f"Failed login attempt for username '{username}'",
+            target_model='User',
+            target_name=str(username) if username else 'Anonymous',
+            details={'attempted_username': username}
+        )
         return Response(
             {"error": "Invalid credentials"},
             status=status.HTTP_401_UNAUTHORIZED
         )
 
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated])
+    def change_password(self, request):
+        """Change current user's password, or admin can change any user's password"""
+        serializer = ChangePasswordSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        user_id = serializer.validated_data.get('user_id')
+        emp_id = serializer.validated_data.get('emp_id')
+        target_username = serializer.validated_data.get('username')
+
+        if (user_id or emp_id or target_username) and is_admin(request.user):
+            target_user = None
+            if user_id:
+                try:
+                    target_user = User.objects.get(pk=user_id)
+                except User.DoesNotExist:
+                    return Response({"error": f"User with id '{user_id}' not found."}, status=status.HTTP_404_NOT_FOUND)
+            elif emp_id:
+                try:
+                    emp = Employee.objects.get(emp_id=emp_id)
+                    if not emp.user:
+                        return Response({"error": f"Employee '{emp_id}' has no associated user account."}, status=status.HTTP_400_BAD_REQUEST)
+                    target_user = emp.user
+                except Employee.DoesNotExist:
+                    return Response({"error": f"Employee with emp_id '{emp_id}' not found."}, status=status.HTTP_404_NOT_FOUND)
+            elif target_username:
+                try:
+                    target_user = User.objects.get(username=target_username)
+                except User.DoesNotExist:
+                    return Response({"error": f"User '{target_username}' not found."}, status=status.HTTP_404_NOT_FOUND)
+        else:
+            target_user = request.user
+            old_pwd = serializer.validated_data.get('old_password')
+            if not old_pwd:
+                return Response({"old_password": ["Current password is required."]}, status=status.HTTP_400_BAD_REQUEST)
+            if not target_user.check_password(old_pwd):
+                return Response({"old_password": ["Current password is incorrect."]}, status=status.HTTP_400_BAD_REQUEST)
+
+        new_pwd = serializer.validated_data['new_password']
+        target_user.set_password(new_pwd)
+        target_user.save()
+
+        log_activity(
+            request=request,
+            actor=request.user,
+            action_type='password_change',
+            category='auth',
+            description=f"Password updated for user '{target_user.username}' by '{request.user.username}'",
+            target_model='User',
+            target_id=target_user.id,
+            target_name=target_user.username,
+            details={'target_user': target_user.username}
+        )
+
+        return Response({
+            "message": f"Password for user '{target_user.username}' updated successfully."
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['post'], permission_classes=[IsAdmin])
+    def update_password(self, request):
+        """Admin endpoint to set/update password for any user/employee"""
+        serializer = AdminSetPasswordSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        user_id = serializer.validated_data.get('user_id')
+        emp_id = serializer.validated_data.get('emp_id')
+        target_username = serializer.validated_data.get('username')
+        new_pwd = serializer.validated_data['resolved_password']
+
+        target_user = None
+        if user_id:
+            try:
+                target_user = User.objects.get(pk=user_id)
+            except User.DoesNotExist:
+                return Response({"error": f"User with id '{user_id}' not found."}, status=status.HTTP_404_NOT_FOUND)
+        elif emp_id:
+            try:
+                emp = Employee.objects.get(emp_id=emp_id)
+                if not emp.user:
+                    return Response({"error": f"Employee '{emp_id}' has no associated user account."}, status=status.HTTP_400_BAD_REQUEST)
+                target_user = emp.user
+            except Employee.DoesNotExist:
+                return Response({"error": f"Employee with emp_id '{emp_id}' not found."}, status=status.HTTP_404_NOT_FOUND)
+        elif target_username:
+            try:
+                target_user = User.objects.get(username=target_username)
+            except User.DoesNotExist:
+                return Response({"error": f"User '{target_username}' not found."}, status=status.HTTP_404_NOT_FOUND)
+        else:
+            return Response({"error": "Please provide user_id, emp_id, or username."}, status=status.HTTP_400_BAD_REQUEST)
+
+        target_user.set_password(new_pwd)
+        target_user.save()
+
+        log_activity(
+            request=request,
+            actor=request.user,
+            action_type='password_reset',
+            category='auth',
+            description=f"Password reset/updated for user '{target_user.username}' by admin '{request.user.username}'",
+            target_model='User',
+            target_id=target_user.id,
+            target_name=target_user.username,
+            details={'target_user': target_user.username}
+        )
+
+        return Response({
+            "message": f"Password for user '{target_user.username}' updated successfully."
+        }, status=status.HTTP_200_OK)
+
 
 class UserAccessLevelViewSet(viewsets.ModelViewSet):
-    """Manage user access levels (admin/manager)"""
-    queryset = UserAccessLevel.objects.all()
+    """Manage user accounts and access levels (admin/manager)"""
+    queryset = UserAccessLevel.objects.all().select_related('user')
     serializer_class = UserAccessLevelSerializer
     permission_classes = [IsAdmin]
-    
+
+    def get_object(self):
+        lookup_url_kwarg = self.lookup_url_kwarg or self.lookup_field
+        lookup_val = self.kwargs.get(lookup_url_kwarg)
+        if lookup_val is not None:
+            try:
+                return UserAccessLevel.objects.get(pk=lookup_val)
+            except (UserAccessLevel.DoesNotExist, ValueError):
+                pass
+            try:
+                return UserAccessLevel.objects.get(Q(user__id=lookup_val) | Q(user__username=lookup_val))
+            except (UserAccessLevel.DoesNotExist, ValueError):
+                pass
+        return super().get_object()
+
+    def perform_create(self, serializer):
+        instance = serializer.save()
+        username = instance.user.username if instance.user else 'Unknown'
+        log_activity(
+            request=self.request,
+            actor=self.request.user,
+            action_type='user_create',
+            category='user',
+            description=f"Created portal user '{username}' with role '{instance.role}'",
+            target_model='UserAccessLevel',
+            target_id=instance.id,
+            target_name=username,
+            details={'username': username, 'role': instance.role}
+        )
+
+    def update(self, request, *args, **kwargs):
+        instance = self.get_object()
+        old_role = instance.role
+        kwargs['partial'] = True
+        response = super().update(request, *args, **kwargs)
+        if response.status_code < 400:
+            instance.refresh_from_db()
+            role_changed = old_role != instance.role
+            action_type = 'role_change' if role_changed else 'user_update'
+            username = instance.user.username if instance.user else 'Unknown'
+            desc = f"Updated role for user '{username}' from '{old_role}' to '{instance.role}'" if role_changed else f"Updated user details for '{username}'"
+            log_activity(
+                request=request,
+                actor=request.user,
+                action_type=action_type,
+                category='user',
+                description=desc,
+                target_model='UserAccessLevel',
+                target_id=instance.id,
+                target_name=username,
+                details={'old_role': old_role, 'new_role': instance.role, 'username': username}
+            )
+        return response
+
+    def perform_destroy(self, instance):
+        username = instance.user.username if instance.user else 'Unknown'
+        role = instance.role
+        log_activity(
+            request=self.request,
+            actor=self.request.user,
+            action_type='user_delete',
+            category='user',
+            description=f"Deleted user access level / account for '{username}' (role: {role})",
+            target_model='UserAccessLevel',
+            target_id=instance.id,
+            target_name=username,
+            details={'username': username, 'role': role}
+        )
+        instance.delete()
+
     @action(detail=False, methods=['get'])
     def admins(self, request):
         """Get all admin users"""
@@ -272,6 +792,29 @@ class UserAccessLevelViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(managers, many=True)
         return Response(serializer.data)
 
+    @action(detail=True, methods=['post'], permission_classes=[IsAdmin])
+    def change_password(self, request, pk=None):
+        """Change password for this user: POST /api/users/{id}/change_password/ or /api/access-levels/{id}/change_password/"""
+        ual = self.get_object()
+        user = ual.user
+        pwd = request.data.get('password') or request.data.get('new_password')
+        if not pwd or len(str(pwd)) < 8:
+            return Response({"password": ["Password must be at least 8 characters long."]}, status=status.HTTP_400_BAD_REQUEST)
+        user.set_password(str(pwd))
+        user.save()
+        log_activity(
+            request=request,
+            actor=request.user,
+            action_type='password_change',
+            category='auth',
+            description=f"Admin '{request.user.username}' changed password for user '{user.username}'",
+            target_model='User',
+            target_id=user.id,
+            target_name=user.username,
+            details={'target_user': user.username}
+        )
+        return Response({"message": f"Password for user '{user.username}' updated successfully."}, status=status.HTTP_200_OK)
+
 
 # Filtering logic for Attendance
 class AttendanceFilter(filters.FilterSet):
@@ -279,10 +822,19 @@ class AttendanceFilter(filters.FilterSet):
     date_to = filters.DateFilter(field_name="date", lookup_expr='lte')
     employee = filters.CharFilter(field_name="employee__emp_id")
     status = filters.CharFilter(field_name="status")
+    search = filters.CharFilter(method='filter_search')
 
     class Meta:
         model = Attendance
-        fields = ['employee', 'date_from', 'date_to', 'status']
+        fields = ['employee', 'date_from', 'date_to', 'status', 'search']
+
+    def filter_search(self, queryset, name, value):
+        if not value:
+            return queryset
+        return queryset.filter(
+            Q(employee__name__icontains=value) |
+            Q(employee__emp_id__icontains=value)
+        )
 
 class EmployeeFilter(filters.FilterSet):
     employee_id = filters.NumberFilter(field_name="emp_id", lookup_expr='exact')
@@ -302,23 +854,131 @@ class EmployeeViewSet(viewsets.ModelViewSet):
     lookup_field = 'emp_id'  # Use emp_id for URL lookups like /employees/EMP001/
     permission_classes = [IsAuthenticated]
 
+    def perform_create(self, serializer):
+        employee = serializer.save()
+        log_activity(
+            request=self.request,
+            actor=self.request.user,
+            action_type='employee_create',
+            category='employee',
+            description=f"Created employee '{employee.name}' (ID: {employee.emp_id}, Designation: {employee.designation or 'N/A'})",
+            target_model='Employee',
+            target_id=employee.emp_id,
+            target_name=employee.name,
+            details={
+                'emp_id': employee.emp_id,
+                'name': employee.name,
+                'designation': employee.designation,
+                'status': employee.status,
+                'current_shift': employee.current_shift.name if employee.current_shift else None
+            }
+        )
+
     def update(self, request, *args, **kwargs):
+        emp_before = self.get_object()
+        old_status = emp_before.status
         kwargs['partial'] = True
         # Perform the update first
         response = super().update(request, *args, **kwargs)
 
-        # If status was set to inactive during this update, record who deactivated and when
-        try:
-            if 'status' in request.data and str(request.data.get('status')).lower() == 'inactive':
-                emp = self.get_object()
-                if not emp.deactivated_at:
-                    emp.deactivated_by = request.user if getattr(request, 'user', None) and request.user.is_authenticated else None
-                    emp.deactivated_at = timezone.now()
+        if response.status_code < 400:
+            emp = self.get_object()
+            new_status = emp.status
+
+            # If status was set to inactive during this update, record who deactivated and when
+            if old_status != 'inactive' and new_status == 'inactive':
+                try:
+                    if not emp.deactivated_at:
+                        emp.deactivated_by = request.user if getattr(request, 'user', None) and request.user.is_authenticated else None
+                        emp.deactivated_at = timezone.now()
+                        emp.save(update_fields=['deactivated_by', 'deactivated_at'])
+                except Exception:
+                    pass
+
+                log_activity(
+                    request=request,
+                    actor=request.user,
+                    action_type='employee_deactivate',
+                    category='employee',
+                    description=f"Deactivated employee '{emp.name}' (ID: {emp.emp_id})",
+                    target_model='Employee',
+                    target_id=emp.emp_id,
+                    target_name=emp.name,
+                    details={'emp_id': emp.emp_id, 'name': emp.name, 'previous_status': old_status, 'new_status': new_status}
+                )
+            elif old_status == 'inactive' and new_status == 'active':
+                try:
+                    emp.deactivated_by = None
+                    emp.deactivated_at = None
                     emp.save(update_fields=['deactivated_by', 'deactivated_at'])
-        except Exception:
-            pass
+                except Exception:
+                    pass
+
+                log_activity(
+                    request=request,
+                    actor=request.user,
+                    action_type='employee_activate',
+                    category='employee',
+                    description=f"Reactivated employee '{emp.name}' (ID: {emp.emp_id})",
+                    target_model='Employee',
+                    target_id=emp.emp_id,
+                    target_name=emp.name,
+                    details={'emp_id': emp.emp_id, 'name': emp.name, 'previous_status': old_status, 'new_status': new_status}
+                )
+            else:
+                log_activity(
+                    request=request,
+                    actor=request.user,
+                    action_type='employee_update',
+                    category='employee',
+                    description=f"Updated employee '{emp.name}' (ID: {emp.emp_id})",
+                    target_model='Employee',
+                    target_id=emp.emp_id,
+                    target_name=emp.name,
+                    details={'emp_id': emp.emp_id, 'name': emp.name, 'status': new_status}
+                )
 
         return response
+
+    def perform_destroy(self, instance):
+        emp_id = instance.emp_id
+        emp_name = instance.name
+        log_activity(
+            request=self.request,
+            actor=self.request.user,
+            action_type='employee_delete',
+            category='employee',
+            description=f"Deleted employee '{emp_name}' (ID: {emp_id})",
+            target_model='Employee',
+            target_id=emp_id,
+            target_name=emp_name,
+            details={'emp_id': emp_id, 'name': emp_name}
+        )
+        instance.delete()
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAdmin])
+    def change_password(self, request, emp_id=None):
+        """Change password for an employee's user account"""
+        employee = self.get_object()
+        if not employee.user:
+            return Response({"error": "This employee does not have an associated user account."}, status=status.HTTP_400_BAD_REQUEST)
+        pwd = request.data.get('password') or request.data.get('new_password')
+        if not pwd or len(str(pwd)) < 8:
+            return Response({"password": ["Password must be at least 8 characters long."]}, status=status.HTTP_400_BAD_REQUEST)
+        employee.user.set_password(str(pwd))
+        employee.user.save()
+        log_activity(
+            request=request,
+            actor=request.user,
+            action_type='password_change',
+            category='auth',
+            description=f"Admin '{request.user.username}' changed password for employee '{employee.name}' (User: {employee.user.username})",
+            target_model='Employee',
+            target_id=employee.emp_id,
+            target_name=employee.name,
+            details={'emp_id': employee.emp_id, 'username': employee.user.username}
+        )
+        return Response({"message": f"Password for employee '{employee.name}' updated successfully."}, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['get'])
     def calculate_payout(self, request, emp_id=None):
@@ -597,6 +1257,16 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             "attendance_records": AttendanceSerializer(attendances, many=True).data
         })
 
+    @action(detail=True, methods=['get'])
+    def detailed_logs(self, request, *args, **kwargs):
+        """Get complete, detailed attendance session breakdown for this employee on a date or date range."""
+        employee = self.get_object()
+        start_date, end_date, err = parse_date_range_params(request)
+        if err:
+            return Response({"error": err}, status=status.HTTP_400_BAD_REQUEST)
+        data = build_employee_detailed_logs(employee, start_date, end_date)
+        return Response(data)
+
     @action(detail=False, methods=['get'])
     def active_employees(self, request):
         """Get list of active employees"""
@@ -781,6 +1451,18 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         employee.current_shift = shift
         employee.save(update_fields=['current_shift'])
 
+        log_activity(
+            request=request,
+            actor=request.user,
+            action_type='shift_assign',
+            category='shift',
+            description=f"Assigned shift '{shift.name}' to employee '{employee.name}' (Effective: {from_date})",
+            target_model='Employee',
+            target_id=employee.emp_id,
+            target_name=employee.name,
+            details={'emp_id': employee.emp_id, 'shift_id': shift.id, 'shift_name': shift.name, 'from_date': str(from_date)}
+        )
+
         serializer = EmployeeShiftHistorySerializer(history_entry)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
@@ -830,6 +1512,18 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         )
         salary_entry.save()
 
+        log_activity(
+            request=request,
+            actor=request.user,
+            action_type='salary_update',
+            category='salary',
+            description=f"Updated salary for employee '{employee.name}' to {salary_val} (Effective: {effective_from})",
+            target_model='Employee',
+            target_id=employee.emp_id,
+            target_name=employee.name,
+            details={'emp_id': employee.emp_id, 'salary': float(salary_val), 'effective_from': str(effective_from)}
+        )
+
         serializer = SalarySerializer(salary_entry)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
@@ -847,12 +1541,18 @@ class EmployeeViewSet(viewsets.ModelViewSet):
 def employee_list(request):
     """Return a simple list of all employees with `id` (emp_id) and `name`.
 
-    No pagination is applied — returns the full list.
+    No pagination is applied - returns the full list.
     The `id` field equals the employee `emp_id` as requested.
     """
     employees = Employee.objects.all().order_by('emp_id')
     data = [{"emp_id": e.emp_id, "name": e.name} for e in employees]
     return Response(data)
+
+class StandardResultsSetPagination(PageNumberPagination):
+    page_size = 20
+    page_size_query_param = 'page_size'
+    max_page_size = 100
+
 
 class AttendanceViewSet(viewsets.ModelViewSet):
     queryset = Attendance.objects.all().order_by('date')
@@ -860,6 +1560,69 @@ class AttendanceViewSet(viewsets.ModelViewSet):
     filter_backends = (filters.DjangoFilterBackend,)
     filterset_class = AttendanceFilter
     permission_classes = [IsAuthenticated]
+    pagination_class = StandardResultsSetPagination
+
+    def perform_create(self, serializer):
+        att = serializer.save()
+        emp_name = att.employee.name if att.employee else 'Unknown'
+        emp_id = att.employee.emp_id if att.employee else None
+        log_activity(
+            request=self.request,
+            actor=self.request.user,
+            action_type='attendance_manual_create',
+            category='attendance',
+            description=f"Manual attendance created for '{emp_name}' (ID: {emp_id}) on {att.date}",
+            target_model='Attendance',
+            target_id=att.id,
+            target_name=emp_name,
+            details={
+                'emp_id': emp_id,
+                'date': str(att.date),
+                'check_in': str(att.check_in) if att.check_in else None,
+                'check_out': str(att.check_out) if att.check_out else None,
+                'status': att.status
+            }
+        )
+
+    def perform_update(self, serializer):
+        att = serializer.save()
+        emp_name = att.employee.name if att.employee else 'Unknown'
+        emp_id = att.employee.emp_id if att.employee else None
+        log_activity(
+            request=self.request,
+            actor=self.request.user,
+            action_type='attendance_update',
+            category='attendance',
+            description=f"Attendance updated for '{emp_name}' (ID: {emp_id}) on {att.date}",
+            target_model='Attendance',
+            target_id=att.id,
+            target_name=emp_name,
+            details={
+                'emp_id': emp_id,
+                'date': str(att.date),
+                'check_in': str(att.check_in) if att.check_in else None,
+                'check_out': str(att.check_out) if att.check_out else None,
+                'status': att.status
+            }
+        )
+
+    def perform_destroy(self, instance):
+        att_id = instance.id
+        emp_name = instance.employee.name if instance.employee else 'Unknown'
+        emp_id = instance.employee.emp_id if instance.employee else None
+        att_date = instance.date
+        log_activity(
+            request=self.request,
+            actor=self.request.user,
+            action_type='attendance_delete',
+            category='attendance',
+            description=f"Attendance deleted for '{emp_name}' (ID: {emp_id}) on {att_date}",
+            target_model='Attendance',
+            target_id=att_id,
+            target_name=emp_name,
+            details={'emp_id': emp_id, 'date': str(att_date)}
+        )
+        instance.delete()
 
     def list(self, request, *args, **kwargs):
         """Return attendance list with filters (date, date_from/date_to, employee, status).
@@ -880,9 +1643,39 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 return Response({"error": "Invalid date format"}, status=status.HTTP_400_BAD_REQUEST)
 
             attendances = qs.filter(date=report_date).order_by('employee', 'check_in')
-            serializer = AttendanceSerializer(attendances, many=True, context={'request': request})
+
+            # Group attendances by employee so each present employee appears once with first IN, last OUT, and summed hours
+            grouped_atts = {}
+            for att in attendances:
+                grouped_atts.setdefault(att.employee.emp_id, []).append(att)
+
+            present_results = []
+            for emp_id_val, att_list in grouped_atts.items():
+                first_att = att_list[0]
+                last_att = att_list[-1]
+                day_total_hours = round(sum(a.total_hours for a in att_list), 2)
+                is_late_val = any(a.status == 'late' for a in att_list)
+                status_val = 'late' if is_late_val else 'on_time'
+
+                present_results.append({
+                    "id": first_att.id,
+                    "employee": first_att.employee.emp_id,
+                    "employee_name": first_att.employee.name,
+                    "date": report_date.isoformat(),
+                    "check_in": first_att.check_in.strftime('%I:%M:%S %p') if first_att.check_in else None,
+                    "check_out": last_att.check_out.strftime('%I:%M:%S %p') if last_att.check_out else None,
+                    "message_late": first_att.message_late,
+                    "status": status_val,
+                    "total_hours": format_hours_display(day_total_hours),
+                    "total_hours_value": day_total_hours,
+                    "sessions_count": len(att_list),
+                    "is_late": is_late_val,
+                    "created_at": first_att.created_at,
+                    "updated_at": last_att.updated_at,
+                })
+
             absent_entries, pending_count = build_absent_entries(report_date, request=request)
-            results = list(serializer.data) + absent_entries
+            results = present_results + absent_entries
 
             # Include any inactive-attendance attempts logged for this date
             inactive_attempts_qs = InactiveAttendanceAttempt.objects.filter(attempted_at__date=report_date)
@@ -1023,18 +1816,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             for idx, emp in enumerate(employees):
                 col = 2 + idx
                 # Find attendances for this employee on the row date, either by stored
-                # `date` or by the `check_in` datetime falling on that date.
-                atts = Attendance.objects.filter(employee=emp).filter(
-                    Q(date=rdate) | Q(check_in__date=rdate)
-                )
-
-                # Prefer attendances whose actual `check_in` falls on this date to avoid
-                # picking an unrelated open record from another day.
-                day_atts = atts.filter(check_in__date=rdate).order_by('check_in')
-                if day_atts.exists():
-                    atts = day_atts
-                else:
-                    atts = atts.order_by('check_in')
+                atts = Attendance.objects.filter(employee=emp, date=rdate).order_by('check_in')
 
                 check_in_val = "--:--"
                 check_out_val = "--:--"
@@ -1053,7 +1835,20 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                             check_out_val = str(last.check_out)
 
                 if atts.exists():
-                    combined = f"{check_in_val} - {check_out_val}"
+                    if atts.count() > 1:
+                        session_lines = []
+                        for i, a in enumerate(atts):
+                            ci = a.check_in.strftime('%I:%M %p') if a.check_in else '--:--'
+                            co = a.check_out.strftime('%I:%M %p') if a.check_out else '--:--'
+                            session_lines.append(f"#{i+1}: {ci} - {co}")
+                        combined = "\n".join(session_lines)
+                        ws.cell(row=row, column=col).alignment = openpyxl.styles.Alignment(horizontal='center', vertical='center', wrap_text=True)
+                        ws.row_dimensions[row].height = max(20, 15 * len(session_lines) + 6)
+                    else:
+                        first = atts.first()
+                        ci = first.check_in.strftime('%I:%M %p') if first.check_in else '--:--'
+                        co = first.check_out.strftime('%I:%M %p') if first.check_out else '--:--'
+                        combined = f"{ci} - {co}"
                 else:
                     # If no attendance, check for approved paid leave covering the date
                     leave = PaidLeave.objects.filter(
@@ -1172,33 +1967,36 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
             for idx, emp in enumerate(employees):
                 col = 2 + idx
-                atts = Attendance.objects.filter(employee=emp).filter(
-                    Q(date=rdate) | Q(check_in__date=rdate)
-                )
-                day_atts = atts.filter(check_in__date=rdate).order_by('check_in')
-                if day_atts.exists():
-                    atts = day_atts
-                else:
-                    atts = atts.order_by('check_in')
+                atts = Attendance.objects.filter(employee=emp, date=rdate).order_by('check_in')
 
                 check_in_val = "--:--"
                 check_out_val = "--:--"
                 if atts.exists():
-                    first = atts.first()
-                    last = atts.last()
-                    if first.check_in:
-                        try:
-                            check_in_val = first.check_in.strftime('%I:%M %p')
-                        except Exception:
-                            check_in_val = str(first.check_in)
-                    if last.check_out:
-                        try:
-                            check_out_val = last.check_out.strftime('%I:%M %p')
-                        except Exception:
-                            check_out_val = str(last.check_out)
+                    if atts.count() > 1:
+                        session_lines = []
+                        for i, a in enumerate(atts):
+                            ci = a.check_in.strftime('%I:%M %p') if a.check_in else '--:--'
+                            co = a.check_out.strftime('%I:%M %p') if a.check_out else '--:--'
+                            session_lines.append(f"#{i+1}: {ci} - {co}")
+                        val = "\n".join(session_lines)
+                        ws.cell(row=row, column=col).alignment = openpyxl.styles.Alignment(horizontal='center', vertical='center', wrap_text=True)
+                        ws.row_dimensions[row].height = max(20, 15 * len(session_lines) + 6)
+                    else:
+                        first = atts.first()
+                        last = atts.last()
+                        if first.check_in:
+                            try:
+                                check_in_val = first.check_in.strftime('%I:%M %p')
+                            except Exception:
+                                check_in_val = str(first.check_in)
+                        if last.check_out:
+                            try:
+                                check_out_val = last.check_out.strftime('%I:%M %p')
+                            except Exception:
+                                check_out_val = str(last.check_out)
+                        val = f"{check_in_val} - {check_out_val}"
                     # accumulate total hours for this day
                     totals[emp.emp_id] += sum(att.total_hours for att in atts)
-
                 else:
                     # Leave handling
                     leave = PaidLeave.objects.filter(
@@ -1208,34 +2006,27 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                         end_time__date__gte=rdate,
                     ).first()
                     if leave:
-                        check_in_val = "Leave"
-                        check_out_val = ""
+                        val = "Leave"
                     else:
                         holiday = Holiday.objects.filter(date=rdate).first()
                         if holiday:
-                            check_in_val = f"Holiday ({holiday.name})"
-                            check_out_val = ""
+                            val = f"Holiday ({holiday.name})"
                         elif emp.weekly_off_day is not None and rdate.weekday() == emp.weekly_off_day:
-                            check_in_val = "Off Day"
-                            check_out_val = ""
+                            val = "Off Day"
                         else:
                             s_start, s_end = get_employee_shift_times(emp, rdate)
                             if not s_start or not s_end:
                                 if rdate < today:
-                                    check_in_val = "Absent"
-                                    check_out_val = ""
+                                    val = "Absent"
                                 else:
-                                    check_in_val = "--:--"
-                                    check_out_val = "--:--"
+                                    val = "--:--"
                             else:
                                 if rdate < today or (rdate == today and current_time >= s_end):
-                                    check_in_val = "Absent"
-                                    check_out_val = ""
+                                    val = "Absent"
                                 else:
-                                    check_in_val = "--:--"
-                                    check_out_val = "--:--"
+                                    val = "--:--"
 
-                ws.cell(row=row, column=col, value=f"{check_in_val} - {check_out_val}" if check_out_val else check_in_val)
+                ws.cell(row=row, column=col, value=val)
 
             row += 1
 
@@ -1282,8 +2073,12 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def daily_report(self, request):
-        """Get daily attendance report for a specific date (defaults to today)"""
+        """Get daily attendance report for a specific date (defaults to today) with search, filter, and pagination support"""
         date_str = request.query_params.get('date')
+        search_query = request.query_params.get('search', '').strip()
+        employee_filter = request.query_params.get('employee', '').strip()
+        status_filter = request.query_params.get('status', '').strip().lower()
+
         today = datetime.now().date()
 
         if not date_str:
@@ -1292,17 +2087,47 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             try:
                 report_date = datetime.strptime(date_str, '%Y-%m-%d').date()
             except ValueError:
-                return Response({"error": "Invalid date format"}, status=400)
+                return Response({"error": "Invalid date format. Use YYYY-MM-DD"}, status=status.HTTP_400_BAD_REQUEST)
 
-        attendances = Attendance.objects.filter(date=report_date)
+        attendances = Attendance.objects.filter(date=report_date).order_by('employee__emp_id', 'check_in')
         total_active_employees = Employee.objects.filter(status='active').count()
 
+        # Group attendances by employee so each present employee appears once with first IN, last OUT, and summed hours
+        grouped_atts = {}
+        for att in attendances:
+            grouped_atts.setdefault(att.employee.emp_id, []).append(att)
+
+        attendance_details = []
+        for emp_id_val, att_list in grouped_atts.items():
+            first_att = att_list[0]
+            last_att = att_list[-1]
+            day_total_hours = round(sum(a.total_hours for a in att_list), 2)
+            is_late_val = any(a.status == 'late' for a in att_list)
+            status_val = 'late' if is_late_val else 'on_time'
+
+            attendance_details.append({
+                "id": first_att.id,
+                "employee": first_att.employee.emp_id,
+                "employee_name": first_att.employee.name,
+                "date": report_date.isoformat(),
+                "check_in": first_att.check_in.strftime('%I:%M:%S %p') if first_att.check_in else None,
+                "check_out": last_att.check_out.strftime('%I:%M:%S %p') if last_att.check_out else None,
+                "message_late": first_att.message_late,
+                "status": status_val,
+                "total_hours": format_hours_display(day_total_hours),
+                "total_hours_value": day_total_hours,
+                "sessions_count": len(att_list),
+                "is_late": is_late_val,
+                "created_at": first_att.created_at,
+                "updated_at": last_att.updated_at,
+            })
+
         # Count UNIQUE employees present today
-        present_count = attendances.values('employee').distinct().count()
+        present_count = len(grouped_atts)
         total_hours = round(sum(att.total_hours for att in attendances), 2)
 
         active_employees = Employee.objects.filter(status='active')
-        present_employee_ids = set(attendances.values_list('employee', flat=True).distinct())
+        present_employee_ids = set(grouped_atts.keys())
         absent_details = []
         pending_count = 0
         current_time = datetime.now().time()
@@ -1329,12 +2154,14 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                     "id": None,
                     "employee": employee.emp_id,
                     "employee_name": employee.name,
-                    "date": report_date,
+                    "date": report_date.isoformat(),
                     "check_in": None,
                     "check_out": None,
                     "message_late": None,
                     "status": status_val,
                     "total_hours": "0h 0m",
+                    "total_hours_value": 0.0,
+                    "sessions_count": 0,
                     "is_late": False,
                     "created_at": None,
                     "updated_at": None,
@@ -1345,11 +2172,52 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         absent_count = len(absent_details)
 
         # Count how many UNIQUE employees were late at least once today
-        late_count = attendances.filter(status='late').values('employee').distinct().count()
-        on_time_count = present_count - late_count
+        late_count = sum(1 for item in attendance_details if item['is_late'])
+        on_time_count = max(0, present_count - late_count)
 
-        return Response({
-            "date": report_date,
+        # Helper to match search query against an entry
+        def matches_search(item, query):
+            q = query.lower()
+            emp_name = str(item.get('employee_name') or '').lower()
+            emp_id_str = str(item.get('employee') or '').lower()
+            return q in emp_name or q in emp_id_str
+
+        # Helper to match employee filter against an entry
+        def matches_employee(item, emp_val):
+            val = str(emp_val).strip().lower()
+            emp_id_str = str(item.get('employee') or '').lower()
+            emp_name = str(item.get('employee_name') or '').lower()
+            return val == emp_id_str or val in emp_id_str or val in emp_name
+
+        # Apply search filter if provided
+        if search_query:
+            attendance_details = [item for item in attendance_details if matches_search(item, search_query)]
+            absent_details = [item for item in absent_details if matches_search(item, search_query)]
+
+        # Apply employee filter if provided
+        if employee_filter:
+            attendance_details = [item for item in attendance_details if matches_employee(item, employee_filter)]
+            absent_details = [item for item in absent_details if matches_employee(item, employee_filter)]
+
+        # Apply status filter if provided
+        if status_filter:
+            if status_filter == 'present':
+                absent_details = []
+            elif status_filter in ('late', 'is_late'):
+                attendance_details = [item for item in attendance_details if item.get('is_late') or item.get('status') == 'late']
+                absent_details = []
+            elif status_filter in ('on_time', 'ontime'):
+                attendance_details = [item for item in attendance_details if not item.get('is_late') and item.get('status') == 'on_time']
+                absent_details = []
+            elif status_filter == 'absent':
+                attendance_details = []
+                absent_details = [item for item in absent_details if item.get('status') == 'absent']
+            elif status_filter in ('on_leave', 'leave'):
+                attendance_details = []
+                absent_details = [item for item in absent_details if item.get('status') == 'on_leave']
+
+        summary_data = {
+            "date": report_date.isoformat(),
             "total_active_employees": total_active_employees,
             "present": present_count,
             "absent": absent_count,
@@ -1358,8 +2226,25 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             "late": late_count,
             "total_hours": format_hours_display(total_hours),
             "total_hours_value": total_hours,
-            "attendance_details": AttendanceSerializer(attendances, many=True).data,
-            "absent_details": absent_details
+            "absent_details": absent_details,
+        }
+
+        # Apply pagination to attendance_details
+        page = self.paginate_queryset(attendance_details)
+        if page is not None:
+            paginated_response = self.get_paginated_response(page).data
+            paginated_response.update({
+                **summary_data,
+                "attendance_details": page,
+                "results": page,
+            })
+            return Response(paginated_response)
+
+        return Response({
+            **summary_data,
+            "count": len(attendance_details),
+            "attendance_details": attendance_details,
+            "results": attendance_details,
         })
 
     @action(detail=False, methods=['get'])
@@ -1449,6 +2334,36 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             "late_arrivals": late_arrivals,
             "average_daily_attendance": round(unique_working_days / unique_employees, 2) if unique_employees > 0 else 0
         })
+
+    @action(detail=False, methods=['get'])
+    def employee_logs(self, request):
+        """Get complete, detailed attendance session breakdown for a selected employee on a date or date range.
+
+        Query params:
+        - emp_id or employee (required): employee ID
+        - date (optional): single date (YYYY-MM-DD)
+        - start_date / date_from and end_date / date_to (optional): date range
+        """
+        emp_param = request.query_params.get('emp_id') or request.query_params.get('employee')
+        if not emp_param:
+            return Response({"error": "emp_id or employee parameter is required"}, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            if str(emp_param).strip().isdigit():
+                employee = Employee.objects.filter(Q(emp_id=int(emp_param)) | Q(pk=int(emp_param))).first()
+            else:
+                employee = Employee.objects.filter(emp_id=emp_param).first()
+            if not employee:
+                return Response({"error": f"Employee with id '{emp_param}' not found"}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        start_date, end_date, err = parse_date_range_params(request)
+        if err:
+            return Response({"error": err}, status=status.HTTP_400_BAD_REQUEST)
+
+        data = build_employee_detailed_logs(employee, start_date, end_date)
+        return Response(data)
 
     @action(detail=False, methods=['post'], permission_classes=[IsAdmin])
     def mark_absent(self, request):
@@ -1619,8 +2534,9 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_200_OK
                 )
 
-        # Get today's shift times
-        s_start, s_end = get_employee_shift_times(employee, today)
+        # Get duty date and shift times for check-in
+        duty_date = get_duty_date_for_check_in(employee, now)
+        s_start, s_end = get_employee_shift_times(employee, duty_date)
 
         # If there's an open attendance (no check_out), treat this request as a check-out
         if last_att and last_att.check_out is None:
@@ -1628,22 +2544,21 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             max_allowed = get_overtime_max_allowed(employee, last_att.check_in)
             if duration > max_allowed:
                 # Auto-check-out and create a new attendance (check-in)
+                duty_date_new = get_duty_date_for_check_in(employee, now)
+                s_start_new, _ = get_employee_shift_times(employee, duty_date_new)
                 new_status = 'on_time'
                 new_late_msg = None
-                if s_start:
-                    new_shift_start = datetime.combine(now.date(), s_start)
-                    if s_end and s_end <= s_start and new_shift_start > now:
-                        if now.time() < s_end:
-                            new_shift_start -= timedelta(days=1)
-                    is_late_new = now > new_shift_start + timedelta(minutes=LATE_GRACE_MINUTES)
+                if s_start_new:
+                    shift_start_dt = datetime.combine(duty_date_new, s_start_new)
+                    is_late_new = now > shift_start_dt + timedelta(minutes=LATE_GRACE_MINUTES)
                     new_status = 'late' if is_late_new else 'on_time'
                     if is_late_new:
-                        mins = int((now - new_shift_start).total_seconds() / 60)
+                        mins = int((now - shift_start_dt).total_seconds() / 60)
                         new_late_msg = f"you are late {mins}m"
 
                 new_att = Attendance.objects.create(
                     employee=employee,
-                    date=timezone.now().date(),
+                    date=duty_date_new,
                     check_in=now,
                     status=new_status,
                     message_late=new_late_msg
@@ -1668,6 +2583,18 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
             total_hours = round(min((now - last_att.check_in).total_seconds() / 3600, max_allowed), 2)
 
+            log_activity(
+                request=request,
+                actor=request.user if (getattr(request, 'user', None) and request.user.is_authenticated) else None,
+                action_type='attendance_checkout',
+                category='attendance',
+                description=f"Check-out: '{employee.name}' (ID: {employee.emp_id}) at {now.strftime('%I:%M %p')} (Worked: {format_hours_display(total_hours)})",
+                target_model='Employee',
+                target_id=employee.emp_id,
+                target_name=employee.name,
+                details={'emp_id': employee.emp_id, 'check_out': now.strftime('%I:%M %p'), 'total_hours': total_hours}
+            )
+
             return Response(
                 {
                     "message": "Check-out successful",
@@ -1681,11 +2608,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         status_val = 'on_time'
         late_msg = None
         if s_start:
-            shift_start_dt = datetime.combine(today, s_start)
-            if s_end and s_end <= s_start and shift_start_dt > now:
-                if now.time() < s_end:
-                    shift_start_dt -= timedelta(days=1)
-
+            shift_start_dt = datetime.combine(duty_date, s_start)
             is_late = now > shift_start_dt + timedelta(minutes=LATE_GRACE_MINUTES)
             status_val = 'late' if is_late else 'on_time'
             if is_late:
@@ -1694,10 +2617,22 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
         attendance = Attendance.objects.create(
             employee=employee,
-            date=today,
+            date=duty_date,
             check_in=now,
             status=status_val,
             message_late=late_msg
+        )
+
+        log_activity(
+            request=request,
+            actor=request.user if (getattr(request, 'user', None) and request.user.is_authenticated) else None,
+            action_type='attendance_checkin',
+            category='attendance',
+            description=f"Check-in: '{employee.name}' (ID: {employee.emp_id}) at {now.strftime('%I:%M %p')} ({status_val})",
+            target_model='Employee',
+            target_id=employee.emp_id,
+            target_name=employee.name,
+            details={'emp_id': employee.emp_id, 'check_in': now.strftime('%I:%M %p'), 'status': status_val, 'date': str(duty_date)}
         )
 
         return Response(
@@ -1811,33 +2746,31 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         message = "Attendance marked"
         if not last_attendance or (last_attendance.check_out is not None):
             # ===== NEW CHECK-IN =====
+            duty_date = get_duty_date_for_check_in(employee, now)
+            s_start, s_end = get_employee_shift_times(employee, duty_date)
+
             is_late = False
             late_msg = "On time"
             if s_start:
-                shift_start_dt = datetime.combine(today, s_start)
-                if s_end and s_end <= s_start and shift_start_dt > now:
-                    if now.time() < s_end:
-                        shift_start_dt -= timedelta(days=1)
-
-            is_late = now > shift_start_dt + timedelta(minutes=LATE_GRACE_MINUTES)
-            if is_late:
-                total_minutes = int((now - shift_start_dt).total_seconds() / 60)
-                # Logic to format as "1h 15m" or just "15m"
-                if total_minutes >= 60:
-                    hours = total_minutes // 60
-                    minutes = total_minutes % 60
-                    if minutes > 0:
-                        late_msg = f"{hours}h {minutes}m late"
+                shift_start_dt = datetime.combine(duty_date, s_start)
+                is_late = now > shift_start_dt + timedelta(minutes=LATE_GRACE_MINUTES)
+                if is_late:
+                    total_minutes = int((now - shift_start_dt).total_seconds() / 60)
+                    if total_minutes >= 60:
+                        hours = total_minutes // 60
+                        minutes = total_minutes % 60
+                        if minutes > 0:
+                            late_msg = f"{hours}h {minutes}m late"
+                        else:
+                            late_msg = f"{hours}h late"
                     else:
-                        late_msg = f"{hours}h late"
-                else:
-                    late_msg = f"{total_minutes}m late"
+                        late_msg = f"{total_minutes}m late"
 
             status_val = 'late' if is_late else 'on_time'
 
             Attendance.objects.create(
                 employee=employee,
-                date=today,
+                date=duty_date,
                 check_in=now,
                 message_late=late_msg,
                 status=status_val
@@ -1854,9 +2787,20 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 "total_hours_today": "0h 0m",
                 "total_hours_today_value": 0
             })
+
+            log_activity(
+                request=request,
+                actor=request.user if (getattr(request, 'user', None) and request.user.is_authenticated) else None,
+                action_type='attendance_checkin',
+                category='attendance',
+                description=f"Check-in: '{employee.name}' (ID: {employee.emp_id}) at {now.strftime('%I:%M %p')} ({status_val})",
+                target_model='Employee',
+                target_id=employee.emp_id,
+                target_name=employee.name,
+                details={'emp_id': employee.emp_id, 'check_in': now.strftime('%I:%M %p'), 'status': status_val, 'date': str(duty_date)}
+            )
         elif last_attendance.check_in is not None and last_attendance.check_out is None:
             # ===== CHECK-OUT =====
-            # Debug: log check_in/now before computing duration
             try:
                 logger.debug(f"Last attendance check_in={last_attendance.check_in}, now={now}")
             except Exception:
@@ -1869,13 +2813,12 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             max_allowed = get_overtime_max_allowed(employee, last_attendance.check_in)
 
             if duration > max_allowed:
+                duty_date_new = get_duty_date_for_check_in(employee, now)
+                s_start_new, _ = get_employee_shift_times(employee, duty_date_new)
                 new_status = 'on_time'
-                new_late_msg = None
-                if s_start:
-                    new_shift_start = datetime.combine(now.date(), s_start)
-                    if s_end and s_end <= s_start and new_shift_start > now:
-                        if now.time() < s_end:
-                            new_shift_start -= timedelta(days=1)
+                new_late_msg = "On time"
+                if s_start_new:
+                    new_shift_start = datetime.combine(duty_date_new, s_start_new)
                     is_late_new = now > new_shift_start + timedelta(minutes=LATE_GRACE_MINUTES)
                     new_status = 'late' if is_late_new else 'on_time'
                     if is_late_new:
@@ -1884,7 +2827,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
                 new_att = Attendance.objects.create(
                     employee=employee,
-                    date=timezone.now().date(),
+                    date=duty_date_new,
                     check_in=now,
                     status=new_status,
                     message_late=new_late_msg
@@ -1901,6 +2844,18 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                     "total_hours_today": "0h 0m",
                     "total_hours_today_value": 0
                 })
+
+                log_activity(
+                    request=request,
+                    actor=request.user if (getattr(request, 'user', None) and request.user.is_authenticated) else None,
+                    action_type='attendance_checkin',
+                    category='attendance',
+                    description=f"Auto check-in: '{employee.name}' (ID: {employee.emp_id}) at {now.strftime('%I:%M %p')} ({new_status})",
+                    target_model='Employee',
+                    target_id=employee.emp_id,
+                    target_name=employee.name,
+                    details={'emp_id': employee.emp_id, 'check_in': now.strftime('%I:%M %p'), 'status': new_status, 'date': str(duty_date_new)}
+                )
             else:
                 last_attendance.check_out = now # Saves literal system time to DB
                 last_attendance.save()
@@ -1912,10 +2867,10 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 if first_checkin:
                     total_duration = (now - first_checkin.check_in).total_seconds() / 3600
                     total_hours = round(min(total_duration, max_allowed), 2)
-                    # Auto overtime: hours worked after shift end
-                    if s_end:
-                        shift_end_dt = datetime.combine(today, s_end)
-                        if s_end <= s_start:
+                    s_start_co, s_end_co = get_employee_shift_times(employee, first_checkin.date)
+                    if s_end_co:
+                        shift_end_dt = datetime.combine(first_checkin.date, s_end_co)
+                        if s_start_co and s_end_co <= s_start_co:
                             shift_end_dt += timedelta(days=1)
                         if now > shift_end_dt:
                             ot_sec = (now - shift_end_dt).total_seconds()
@@ -1940,6 +2895,18 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                     "regular_hours": regular_hours,
                     "overtime_hours": overtime_hours
                 })
+
+                log_activity(
+                    request=request,
+                    actor=request.user if (getattr(request, 'user', None) and request.user.is_authenticated) else None,
+                    action_type='attendance_checkout',
+                    category='attendance',
+                    description=f"Check-out: '{employee.name}' (ID: {employee.emp_id}) at {now.strftime('%I:%M %p')} (Worked: {format_hours_display(total_hours)})",
+                    target_model='Employee',
+                    target_id=employee.emp_id,
+                    target_name=employee.name,
+                    details={'emp_id': employee.emp_id, 'check_out': now.strftime('%I:%M %p'), 'total_hours': total_hours, 'regular_hours': regular_hours, 'overtime_hours': overtime_hours}
+                )
 
         response_payload = {
             "message": message,
@@ -1968,6 +2935,64 @@ class PaidLeaveViewSet(viewsets.ModelViewSet):
     serializer_class = PaidLeaveSerializer
     permission_classes = [IsAuthenticated]
 
+    def perform_create(self, serializer):
+        leave = serializer.save()
+        emp_name = leave.employee.name if leave.employee else 'Unknown'
+        emp_id = leave.employee.emp_id if leave.employee else None
+        log_activity(
+            request=self.request,
+            actor=self.request.user,
+            action_type='leave_apply',
+            category='leave',
+            description=f"Leave application created for '{emp_name}' ({leave.leave_type}, {leave.start_time.date()} to {leave.end_time.date()})",
+            target_model='PaidLeave',
+            target_id=leave.id,
+            target_name=emp_name,
+            details={
+                'emp_id': emp_id,
+                'leave_type': leave.leave_type,
+                'start_time': str(leave.start_time),
+                'end_time': str(leave.end_time),
+                'reason': leave.reason
+            }
+        )
+
+    def perform_update(self, serializer):
+        leave = serializer.save()
+        emp_name = leave.employee.name if leave.employee else 'Unknown'
+        emp_id = leave.employee.emp_id if leave.employee else None
+        log_activity(
+            request=self.request,
+            actor=self.request.user,
+            action_type='leave_apply',
+            category='leave',
+            description=f"Leave updated for '{emp_name}' ({leave.leave_type}, approved={leave.approved})",
+            target_model='PaidLeave',
+            target_id=leave.id,
+            target_name=emp_name,
+            details={
+                'emp_id': emp_id,
+                'leave_type': leave.leave_type,
+                'approved': leave.approved
+            }
+        )
+
+    def perform_destroy(self, instance):
+        emp_name = instance.employee.name if instance.employee else 'Unknown'
+        emp_id = instance.employee.emp_id if instance.employee else None
+        log_activity(
+            request=self.request,
+            actor=self.request.user,
+            action_type='leave_delete',
+            category='leave',
+            description=f"Leave deleted for '{emp_name}' ({instance.leave_type}, {instance.start_time.date()})",
+            target_model='PaidLeave',
+            target_id=instance.id,
+            target_name=emp_name,
+            details={'emp_id': emp_id, 'leave_type': instance.leave_type}
+        )
+        instance.delete()
+
     @action(detail=True, methods=['post'])
     def approve(self, request, pk=None):
         """Approve a leave request"""
@@ -1975,6 +3000,19 @@ class PaidLeaveViewSet(viewsets.ModelViewSet):
         leave.approved = True
         leave.approved_by = request.data.get('approved_by', 'Admin')
         leave.save()
+        emp_name = leave.employee.name if leave.employee else 'Unknown'
+        emp_id = leave.employee.emp_id if leave.employee else None
+        log_activity(
+            request=request,
+            actor=request.user,
+            action_type='leave_approve',
+            category='leave',
+            description=f"Leave approved for '{emp_name}' ({leave.leave_type}, {leave.start_time.date()} to {leave.end_time.date()})",
+            target_model='PaidLeave',
+            target_id=leave.id,
+            target_name=emp_name,
+            details={'emp_id': emp_id, 'approved_by': leave.approved_by}
+        )
         return Response(
             {"message": "Leave approved", "leave": PaidLeaveSerializer(leave).data}
         )
@@ -1983,7 +3021,22 @@ class PaidLeaveViewSet(viewsets.ModelViewSet):
     def reject(self, request, pk=None):
         """Reject a leave request"""
         leave = self.get_object()
+        emp_name = leave.employee.name if leave.employee else 'Unknown'
+        emp_id = leave.employee.emp_id if leave.employee else None
+        leave_id = leave.id
+        leave_type = leave.leave_type
         leave.delete()
+        log_activity(
+            request=request,
+            actor=request.user,
+            action_type='leave_reject',
+            category='leave',
+            description=f"Leave rejected and removed for '{emp_name}' ({leave_type})",
+            target_model='PaidLeave',
+            target_id=leave_id,
+            target_name=emp_name,
+            details={'emp_id': emp_id, 'leave_type': leave_type}
+        )
         return Response(
             {"message": "Leave request rejected"},
             status=status.HTTP_204_NO_CONTENT
@@ -2023,11 +3076,100 @@ class ShiftViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     pagination_class = ShiftPagination
 
+    def perform_create(self, serializer):
+        shift = serializer.save()
+        log_activity(
+            request=self.request,
+            actor=self.request.user,
+            action_type='shift_create',
+            category='shift',
+            description=f"Created shift '{shift.name}' ({shift.start_time} - {shift.end_time})",
+            target_model='Shift',
+            target_id=shift.id,
+            target_name=shift.name,
+            details={'name': shift.name, 'start_time': str(shift.start_time), 'end_time': str(shift.end_time)}
+        )
+
+    def perform_update(self, serializer):
+        shift = serializer.save()
+        log_activity(
+            request=self.request,
+            actor=self.request.user,
+            action_type='shift_update',
+            category='shift',
+            description=f"Updated shift '{shift.name}' ({shift.start_time} - {shift.end_time})",
+            target_model='Shift',
+            target_id=shift.id,
+            target_name=shift.name,
+            details={'name': shift.name, 'start_time': str(shift.start_time), 'end_time': str(shift.end_time)}
+        )
+
+    def perform_destroy(self, instance):
+        shift_id = instance.id
+        shift_name = instance.name
+        log_activity(
+            request=self.request,
+            actor=self.request.user,
+            action_type='shift_delete',
+            category='shift',
+            description=f"Deleted shift '{shift_name}' (ID: {shift_id})",
+            target_model='Shift',
+            target_id=shift_id,
+            target_name=shift_name,
+            details={'shift_id': shift_id, 'name': shift_name}
+        )
+        instance.delete()
+
 
 class HolidayViewSet(viewsets.ModelViewSet):
     queryset = Holiday.objects.all().order_by('date')
     serializer_class = HolidaySerializer
     permission_classes = [IsAuthenticated]
+
+    def perform_create(self, serializer):
+        holiday = serializer.save()
+        log_activity(
+            request=self.request,
+            actor=self.request.user,
+            action_type='holiday_create',
+            category='holiday',
+            description=f"Created holiday '{holiday.name}' on {holiday.date} (Paid: {holiday.is_paid})",
+            target_model='Holiday',
+            target_id=holiday.id,
+            target_name=holiday.name,
+            details={'name': holiday.name, 'date': str(holiday.date), 'is_paid': holiday.is_paid}
+        )
+
+    def perform_update(self, serializer):
+        holiday = serializer.save()
+        log_activity(
+            request=self.request,
+            actor=self.request.user,
+            action_type='holiday_update',
+            category='holiday',
+            description=f"Updated holiday '{holiday.name}' on {holiday.date}",
+            target_model='Holiday',
+            target_id=holiday.id,
+            target_name=holiday.name,
+            details={'name': holiday.name, 'date': str(holiday.date), 'is_paid': holiday.is_paid}
+        )
+
+    def perform_destroy(self, instance):
+        h_id = instance.id
+        h_name = instance.name
+        h_date = instance.date
+        log_activity(
+            request=self.request,
+            actor=self.request.user,
+            action_type='holiday_delete',
+            category='holiday',
+            description=f"Deleted holiday '{h_name}' on {h_date}",
+            target_model='Holiday',
+            target_id=h_id,
+            target_name=h_name,
+            details={'name': h_name, 'date': str(h_date)}
+        )
+        instance.delete()
 
 
 class OvertimeViewSet(viewsets.ModelViewSet):
@@ -2038,7 +3180,52 @@ class OvertimeViewSet(viewsets.ModelViewSet):
     filterset_fields = ['date', 'employee__emp_id', 'status']
 
     def perform_create(self, serializer):
-        serializer.save()
+        ot = serializer.save()
+        emp_name = ot.employee.name if ot.employee else 'Unknown'
+        emp_id = ot.employee.emp_id if ot.employee else None
+        tot_hrs = getattr(ot, 'total_hours', 0)
+        log_activity(
+            request=self.request,
+            actor=self.request.user,
+            action_type='overtime_create',
+            category='overtime',
+            description=f"Recorded overtime for '{emp_name}' on {ot.date} ({tot_hrs}h, status: {ot.status})",
+            target_model='Overtime',
+            target_id=ot.id,
+            target_name=emp_name,
+            details={'emp_id': emp_id, 'date': str(ot.date), 'hours': float(tot_hrs or 0), 'status': ot.status}
+        )
+
+    def perform_update(self, serializer):
+        ot = serializer.save()
+        emp_name = ot.employee.name if ot.employee else 'Unknown'
+        log_activity(
+            request=self.request,
+            actor=self.request.user,
+            action_type='overtime_create',
+            category='overtime',
+            description=f"Updated overtime for '{emp_name}' on {ot.date} (status: {ot.status})",
+            target_model='Overtime',
+            target_id=ot.id,
+            target_name=emp_name,
+            details={'emp_id': ot.employee.emp_id if ot.employee else None, 'date': str(ot.date), 'status': ot.status}
+        )
+
+    def perform_destroy(self, instance):
+        ot_id = instance.id
+        emp_name = instance.employee.name if instance.employee else 'Unknown'
+        log_activity(
+            request=self.request,
+            actor=self.request.user,
+            action_type='overtime_delete',
+            category='overtime',
+            description=f"Deleted overtime for '{emp_name}' on {instance.date}",
+            target_model='Overtime',
+            target_id=ot_id,
+            target_name=emp_name,
+            details={'emp_id': instance.employee.emp_id if instance.employee else None, 'date': str(instance.date)}
+        )
+        instance.delete()
 
     @action(detail=True, methods=['post'])
     def approve(self, request, pk=None):
@@ -2049,6 +3236,19 @@ class OvertimeViewSet(viewsets.ModelViewSet):
         ot.status = 'approved'
         ot.approved_by = request.user if request.user.is_authenticated else None
         ot.save()
+        emp_name = ot.employee.name if ot.employee else 'Unknown'
+        tot_hrs = getattr(ot, 'total_hours', 0)
+        log_activity(
+            request=request,
+            actor=request.user,
+            action_type='overtime_approve',
+            category='overtime',
+            description=f"Approved overtime for '{emp_name}' on {ot.date} ({tot_hrs}h)",
+            target_model='Overtime',
+            target_id=ot.id,
+            target_name=emp_name,
+            details={'emp_id': ot.employee.emp_id if ot.employee else None, 'date': str(ot.date), 'hours': float(tot_hrs or 0)}
+        )
         return Response(OvertimeSerializer(ot).data)
 
     @action(detail=True, methods=['post'])
@@ -2060,6 +3260,18 @@ class OvertimeViewSet(viewsets.ModelViewSet):
         ot.status = 'rejected'
         ot.approved_by = request.user if request.user.is_authenticated else None
         ot.save()
+        emp_name = ot.employee.name if ot.employee else 'Unknown'
+        log_activity(
+            request=request,
+            actor=request.user,
+            action_type='overtime_reject',
+            category='overtime',
+            description=f"Rejected overtime for '{emp_name}' on {ot.date}",
+            target_model='Overtime',
+            target_id=ot.id,
+            target_name=emp_name,
+            details={'emp_id': ot.employee.emp_id if ot.employee else None, 'date': str(ot.date)}
+        )
         return Response(OvertimeSerializer(ot).data)
 
 
@@ -2154,7 +3366,7 @@ def _build_excel_response(output_data, start_date, end_date):
 
     # 1. Report Title & Subtitle
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=num_cols)
-    title_cell = ws.cell(row=1, column=1, value="FDPP EMS — COMPREHENSIVE ATTENDANCE & PAYROLL REPORT")
+    title_cell = ws.cell(row=1, column=1, value="FDPP EMS - COMPREHENSIVE ATTENDANCE & PAYROLL REPORT")
     title_cell.font = title_font
     title_cell.alignment = left_align
     ws.row_dimensions[1].height = 26
@@ -2296,17 +3508,33 @@ def _build_excel_response(output_data, start_date, end_date):
                 c_val.font = status_absent_font
                 c_val.fill = cell_absent_fill
             else:
-                in_str = cell_data.get('in_time') or '--:--'
-                out_str = cell_data.get('out_time') or '--:--'
-                val = f"{in_str} - {out_str}"
+                sessions = cell_data.get('sessions', [])
+                day_hours_str = cell_data.get('total_hours_display') or "0h 0m"
+                if len(sessions) > 1:
+                    lines = [f"#{i+1}: {s['check_in']} - {s['check_out']} ({s['total_hours_display']})" for i, s in enumerate(sessions)]
+                    lines.append(f"[Total: {day_hours_str}]")
+                    val = "\n".join(lines)
+                    c_val.value = val
+                    c_val.alignment = openpyxl.styles.Alignment(horizontal='center', vertical='center', wrap_text=True)
+                    needed_height = max(22, 16 * len(lines) + 8)
+                    if ws.row_dimensions[current_row].height is None or ws.row_dimensions[current_row].height < needed_height:
+                        ws.row_dimensions[current_row].height = needed_height
+                elif len(sessions) == 1:
+                    s0 = sessions[0]
+                    val = f"{s0['check_in']} - {s0['check_out']} ({s0['total_hours_display']})"
+                    c_val.value = val
+                    c_val.alignment = openpyxl.styles.Alignment(horizontal='center', vertical='center', wrap_text=False)
+                else:
+                    in_str = cell_data.get('in_time') or '--:--'
+                    out_str = cell_data.get('out_time') or '--:--'
+                    val = f"{in_str} - {out_str}"
+                    if day_hours_str and day_hours_str != "0h 0m":
+                        val += f" ({day_hours_str})"
+                    elif cell_data.get('total_hours'):
+                        val += f" ({cell_data.get('total_hours')}h)"
+                    c_val.value = val
+                    c_val.alignment = openpyxl.styles.Alignment(horizontal='center', vertical='center', wrap_text=False)
                 
-                day_hours_str = cell_data.get('total_hours_display')
-                if day_hours_str and day_hours_str != "0h 0m":
-                    val += f" ({day_hours_str})"
-                elif cell_data.get('total_hours'):
-                    val += f" ({cell_data.get('total_hours')}h)"
-                
-                c_val.value = val
                 c_val.font = regular_font
 
         current_row += 1
@@ -2444,8 +3672,9 @@ def _build_excel_response(output_data, start_date, end_date):
             cell = ws.cell(row=r_idx, column=col_idx)
             if cell.value is not None:
                 val_str = str(cell.value)
-                if len(val_str) > max_len:
-                    max_len = len(val_str)
+                line_len = max((len(l) for l in val_str.split('\n')), default=0)
+                if line_len > max_len:
+                    max_len = line_len
 
         if col_idx == 1:
             ws.column_dimensions[col_letter].width = max(max_len + 4, 16)
@@ -2546,7 +3775,7 @@ class ComprehensiveReportView(APIView):
 
         att_map = {}
         for a in attendances:
-            att_map.setdefault(a.employee.emp_id, {})[a.date] = a
+            att_map.setdefault(a.employee.emp_id, {}).setdefault(a.date, []).append(a)
 
         ot_map = {}
         for o in overtimes:
@@ -2620,7 +3849,8 @@ class ComprehensiveReportView(APIView):
                 weekly_off = emp.weekly_off_day
                 is_off = weekly_off is not None and current_date.weekday() == weekly_off
 
-                att = att_map.get(emp_id, {}).get(current_date)
+                raw_atts = att_map.get(emp_id, {}).get(current_date, [])
+                att_list = sorted(raw_atts, key=lambda a: a.check_in if a.check_in else datetime.min)
                 ot_rec = ot_map.get(emp_id, {}).get(current_date)
                 lv_records = leaves_map.get(emp_id, {}).get(current_date, [])
 
@@ -2638,15 +3868,36 @@ class ComprehensiveReportView(APIView):
                 out_time = None
                 status_val = 'absent'
                 ot_hours = 0.0
+                sessions = []
 
                 if on_leave:
                     status_val = 'leave'
                 elif is_holiday:
                     status_val = 'holiday'
-                elif att:
-                    in_time = att.check_in.time() if att.check_in else None
-                    out_time = att.check_out.time() if att.check_out else None
-                    status_val = att.status
+                elif att_list:
+                    first_att = att_list[0]
+                    last_att = att_list[-1]
+                    in_time = first_att.check_in.time() if first_att.check_in else None
+                    out_time = last_att.check_out.time() if last_att.check_out else None
+                    is_late_day = any(a.status == 'late' for a in att_list)
+                    status_val = 'late' if is_late_day else 'on_time'
+
+                    for a in att_list:
+                        s_in = a.check_in.strftime('%I:%M:%S %p') if a.check_in else '--:--'
+                        s_out = a.check_out.strftime('%I:%M:%S %p') if a.check_out else '--:--'
+                        s_hrs = float(a.total_hours)
+                        s_disp = format_hours_display(s_hrs)
+                        sessions.append({
+                            'id': a.id,
+                            'check_in': s_in,
+                            'check_out': s_out,
+                            'total_hours': s_hrs,
+                            'total_hours_display': s_disp,
+                            'status': a.status,
+                            'is_late': a.is_late,
+                            'text': f"{s_in} - {s_out} ({s_disp})"
+                        })
+
                     # Auto overtime from attendance (after shift end)
                     emp_sh = sh_map.get(emp_id, [])
                     app_sh = None
@@ -2659,12 +3910,12 @@ class ComprehensiveReportView(APIView):
                     if app_sh and app_sh.shift:
                         ot_s_start = app_sh.shift_start_time or app_sh.shift.start_time
                         ot_s_end = app_sh.shift_end_time or app_sh.shift.end_time
-                        if att.check_out and ot_s_start and ot_s_end:
+                        if last_att.check_out and ot_s_start and ot_s_end:
                             att_shift_end = datetime.combine(current_date, ot_s_end)
                             if ot_s_end <= ot_s_start:
                                 att_shift_end += timedelta(days=1)
-                            if att.check_out > att_shift_end:
-                                auto_ot = (att.check_out - att_shift_end).total_seconds() / 3600
+                            if last_att.check_out > att_shift_end:
+                                auto_ot = (last_att.check_out - att_shift_end).total_seconds() / 3600
                                 ot_hours += max(0, auto_ot)
                 elif is_off:
                     status_val = 'off_day'
@@ -2677,8 +3928,8 @@ class ComprehensiveReportView(APIView):
                 in_str = in_time.strftime('%I:%M:%S %p') if in_time else None
                 out_str = out_time.strftime('%I:%M:%S %p') if out_time else None
                 
-                day_total_hours = float(att.total_hours) if att else 0.0
-                day_total_hours_display = format_hours_display(att.total_hours) if att else "0h 0m"
+                day_total_hours = round(sum(float(a.total_hours) for a in att_list), 2) if att_list else 0.0
+                day_total_hours_display = format_hours_display(day_total_hours) if att_list else "0h 0m"
 
                 cells[str(emp_id)] = {
                     'in_time': in_str,
@@ -2686,6 +3937,8 @@ class ComprehensiveReportView(APIView):
                     'status': status_val,
                     'total_hours': day_total_hours,
                     'total_hours_display': day_total_hours_display,
+                    'sessions_count': len(sessions),
+                    'sessions': sessions,
                     'overtime_hours': round(ot_hours, 2),
                     'leave': on_leave,
                     'leave_type': leave_type,
@@ -2784,21 +4037,10 @@ class ComprehensiveReportView(APIView):
                 ot_h = float(cell.get('overtime_hours', 0) or 0)
 
                 if st == 'on_time' or st == 'late':
-                    att = att_map.get(emp_id, {}).get(d)
-                    day_hours = float(att.total_hours) if att else sh
+                    day_hours = float(cell.get('total_hours', 0.0) or 0.0)
                     total_hours += day_hours
                     days_present += 1
                     regular_pay += day_hours * hr
-                    # Auto overtime from attendance (after shift end)
-                    s_start_i = si.get('s_start')
-                    s_end_i = si.get('s_end')
-                    if att and att.check_out and s_start_i and s_end_i:
-                        att_shift_end = datetime.combine(d, s_end_i)
-                        if s_end_i <= s_start_i:
-                            att_shift_end += timedelta(days=1)
-                        if att.check_out > att_shift_end:
-                            auto_ot = (att.check_out - att_shift_end).total_seconds() / 3600
-                            ot_h += max(0, auto_ot)
                 elif st == 'absent':
                     days_absent += 1
                 elif st == 'leave':
@@ -2862,3 +4104,99 @@ class ComprehensiveReportView(APIView):
             return _build_excel_response(output_data, start_date, end_date)
 
         return Response(output_data)
+
+
+class ActivityLogFilter(filters.FilterSet):
+    category = filters.CharFilter(field_name='category', lookup_expr='exact')
+    action_type = filters.CharFilter(field_name='action_type', lookup_expr='exact')
+    actor = filters.NumberFilter(field_name='actor__id', lookup_expr='exact')
+    actor_username = filters.CharFilter(field_name='actor_username', lookup_expr='icontains')
+    target_model = filters.CharFilter(field_name='target_model', lookup_expr='exact')
+    target_id = filters.CharFilter(field_name='target_id', lookup_expr='exact')
+    target_name = filters.CharFilter(field_name='target_name', lookup_expr='icontains')
+    date_from = filters.DateFilter(field_name='created_at__date', lookup_expr='gte')
+    date_to = filters.DateFilter(field_name='created_at__date', lookup_expr='lte')
+    search = filters.CharFilter(method='filter_search')
+
+    class Meta:
+        model = ActivityLog
+        fields = [
+            'category', 'action_type', 'actor', 'actor_username',
+            'target_model', 'target_id', 'target_name', 'date_from', 'date_to', 'search'
+        ]
+
+    def filter_search(self, queryset, name, value):
+        if not value:
+            return queryset
+        val = str(value).strip()
+        return queryset.filter(
+            Q(description__icontains=val) |
+            Q(actor_username__icontains=val) |
+            Q(actor_name__icontains=val) |
+            Q(target_name__icontains=val) |
+            Q(target_id__icontains=val) |
+            Q(action_type__icontains=val) |
+            Q(category__icontains=val)
+        )
+
+
+class ActivityLogPagination(PageNumberPagination):
+    page_size = 25
+    page_size_query_param = 'page_size'
+    max_page_size = 100
+
+
+class ActivityLogViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    ViewSet for viewing Activity Logs across the portal.
+    Endpoints:
+    - GET /api/activities/
+    - GET /api/activities/{id}/
+    - GET /api/activities/summary/
+    - GET /api/activities/categories/
+    """
+    queryset = ActivityLog.objects.all().select_related('actor')
+    serializer_class = ActivityLogSerializer
+    permission_classes = [IsAdmin]
+    filter_backends = (filters.DjangoFilterBackend,)
+    filterset_class = ActivityLogFilter
+    pagination_class = ActivityLogPagination
+
+    @action(detail=False, methods=['get'])
+    def summary(self, request):
+        """Returns statistics and overview breakdown of activity logs."""
+        from django.db.models import Count
+        today = timezone.now().date()
+        total_count = ActivityLog.objects.count()
+        today_count = ActivityLog.objects.filter(created_at__date=today).count()
+
+        category_counts = list(
+            ActivityLog.objects.values('category')
+            .annotate(count=Count('id'))
+            .order_by('-count')
+        )
+
+        action_counts = list(
+            ActivityLog.objects.values('action_type')
+            .annotate(count=Count('id'))
+            .order_by('-count')[:15]
+        )
+
+        recent = ActivityLog.objects.all()[:10]
+        recent_serialized = ActivityLogSerializer(recent, many=True).data
+
+        return Response({
+            "total_activities": total_count,
+            "today_activities": today_count,
+            "categories_breakdown": category_counts,
+            "top_actions": action_counts,
+            "recent_activities": recent_serialized
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['get'])
+    def categories(self, request):
+        """Returns the dictionary/list of categories and actions available for filtering."""
+        return Response({
+            "categories": [{"key": c[0], "label": c[1]} for c in ActivityLog.CATEGORY_CHOICES],
+            "actions": [{"key": a[0], "label": a[1]} for a in ActivityLog.ACTION_CHOICES],
+        }, status=status.HTTP_200_OK)
