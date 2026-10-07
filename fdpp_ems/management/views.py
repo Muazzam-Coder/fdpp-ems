@@ -35,12 +35,42 @@ from channels.layers import get_channel_layer
 from io import BytesIO
 from django.http import HttpResponse
 import logging
+import threading
+import time as pytime
 try:
     import openpyxl
     from openpyxl.utils import get_column_letter
 except Exception:
     openpyxl = None
     get_column_letter = None
+
+def broadcast_biometric_event_async(event_type, payload_data, group_name="biometric_device"):
+    """Dispatches WebSocket group_send asynchronously in a daemon thread so HTTP response returns immediately (< 30ms) without blocking."""
+    def _send():
+        try:
+            channel_layer = get_channel_layer()
+            if channel_layer:
+                if event_type == "biometric_duplicate":
+                    msg = payload_data.get("message", "") if isinstance(payload_data, dict) else str(payload_data)
+                    async_to_sync(channel_layer.group_send)(
+                        group_name,
+                        {
+                            "type": "biometric_duplicate",
+                            "message": msg
+                        }
+                    )
+                else:
+                    async_to_sync(channel_layer.group_send)(
+                        group_name,
+                        {
+                            "type": "biometric_event",
+                            "data": payload_data
+                        }
+                    )
+        except Exception as e:
+            logging.getLogger('management').error(f"WS broadcast error: {e}")
+
+    threading.Thread(target=_send, daemon=True).start()
 
 # Grace period for lateness in minutes (configurable via Django settings)
 LATE_GRACE_MINUTES = getattr(settings, 'LATE_GRACE_MINUTES', 10)
@@ -2481,7 +2511,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             )
 
         try:
-            employee = Employee.objects.get(emp_id=emp_id)
+            employee = Employee.objects.select_related('current_shift').get(emp_id=emp_id)
         except Employee.DoesNotExist:
             return Response(
                 {"error": f"Employee with id {emp_id} not found"},
@@ -2518,13 +2548,9 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             elapsed = int((now - last_event).total_seconds())
             if elapsed < 10:
                 wait = 10 - elapsed
-                channel_layer = get_channel_layer()
-                async_to_sync(channel_layer.group_send)(
-                    "biometric_device",
-                    {
-                        "type": "biometric_duplicate",
-                        "message": f"You already marked your attendance, Wait for {wait}s to try again",
-                    }
+                broadcast_biometric_event_async(
+                    "biometric_duplicate",
+                    {"message": f"You already marked your attendance, Wait for {wait}s to try again"}
                 )
                 return Response(
                     {
@@ -2592,7 +2618,8 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 target_model='Employee',
                 target_id=employee.emp_id,
                 target_name=employee.name,
-                details={'emp_id': employee.emp_id, 'check_out': now.strftime('%I:%M %p'), 'total_hours': total_hours}
+                details={'emp_id': employee.emp_id, 'check_out': now.strftime('%I:%M %p'), 'total_hours': total_hours},
+                async_log=True
             )
 
             return Response(
@@ -2632,7 +2659,8 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             target_model='Employee',
             target_id=employee.emp_id,
             target_name=employee.name,
-            details={'emp_id': employee.emp_id, 'check_in': now.strftime('%I:%M %p'), 'status': status_val, 'date': str(duty_date)}
+            details={'emp_id': employee.emp_id, 'check_in': now.strftime('%I:%M %p'), 'status': status_val, 'date': str(duty_date)},
+            async_log=True
         )
 
         return Response(
@@ -2645,13 +2673,14 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['post'], permission_classes=[AllowAny])
     def auto_attendance(self, request):
+        _t_start = pytime.perf_counter()
         emp_id = request.data.get('emp_id')
         
         if not emp_id:
             return Response({"error": "emp_id is required"}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            employee = Employee.objects.get(emp_id=emp_id)
+            employee = Employee.objects.select_related('current_shift').get(emp_id=emp_id)
         except Employee.DoesNotExist:
             return Response({"error": f"Employee with id {emp_id} not found"}, status=status.HTTP_404_NOT_FOUND)
 
@@ -2709,15 +2738,11 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             elapsed = int((now - last_event).total_seconds())
             if elapsed < 10:
                 wait = 10 - elapsed
-                channel_layer = get_channel_layer()
-                async_to_sync(channel_layer.group_send)(
-                    "biometric_device",
-                    {
-                        "type": "biometric_duplicate",
-                        "message": f"You already marked your attendance, Wait for {wait}s to try again",
-                    }
+                broadcast_biometric_event_async(
+                    "biometric_duplicate",
+                    {"message": f"You already marked your attendance, Wait for {wait}s to try again"}
                 )
-                return Response(
+                resp = Response(
                     {
                         "message": f"You already marked your attendance, Wait for {wait}s to try again",
                         "duplicate": True,
@@ -2725,6 +2750,8 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                     },
                     status=status.HTTP_200_OK
                 )
+                resp['X-Response-Time'] = f"{round((pytime.perf_counter() - _t_start) * 1000, 2)}ms"
+                return resp
         # For total hours calculation when checking out, use the last open check-in (the same record)
         first_checkin = None
         if last_attendance and last_attendance.check_out is None:
@@ -2797,7 +2824,8 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 target_model='Employee',
                 target_id=employee.emp_id,
                 target_name=employee.name,
-                details={'emp_id': employee.emp_id, 'check_in': now.strftime('%I:%M %p'), 'status': status_val, 'date': str(duty_date)}
+                details={'emp_id': employee.emp_id, 'check_in': now.strftime('%I:%M %p'), 'status': status_val, 'date': str(duty_date)},
+                async_log=True
             )
         elif last_attendance.check_in is not None and last_attendance.check_out is None:
             # ===== CHECK-OUT =====
@@ -2854,7 +2882,8 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                     target_model='Employee',
                     target_id=employee.emp_id,
                     target_name=employee.name,
-                    details={'emp_id': employee.emp_id, 'check_in': now.strftime('%I:%M %p'), 'status': new_status, 'date': str(duty_date_new)}
+                    details={'emp_id': employee.emp_id, 'check_in': now.strftime('%I:%M %p'), 'status': new_status, 'date': str(duty_date_new)},
+                    async_log=True
                 )
             else:
                 last_attendance.check_out = now # Saves literal system time to DB
@@ -2905,7 +2934,8 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                     target_model='Employee',
                     target_id=employee.emp_id,
                     target_name=employee.name,
-                    details={'emp_id': employee.emp_id, 'check_out': now.strftime('%I:%M %p'), 'total_hours': total_hours, 'regular_hours': regular_hours, 'overtime_hours': overtime_hours}
+                    details={'emp_id': employee.emp_id, 'check_out': now.strftime('%I:%M %p'), 'total_hours': total_hours, 'regular_hours': regular_hours, 'overtime_hours': overtime_hours},
+                    async_log=True
                 )
 
         response_payload = {
@@ -2914,21 +2944,14 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             "data": attendance_info
         }
 
-        # Broadcast to WebSocket only if we created or updated a record
+        # Broadcast to WebSocket asynchronously only if we created or updated a record
         if did_modify:
-            try:
-                channel_layer = get_channel_layer()
-                async_to_sync(channel_layer.group_send)(
-                    "biometric_device",
-                    {
-                        "type": "biometric_event",
-                        "data": attendance_info 
-                    }
-                )
-            except Exception as e:
-                print(f"WS Error: {e}")
+            broadcast_biometric_event_async("biometric_event", attendance_info)
 
-        return Response(response_payload, status=status.HTTP_200_OK)
+        resp = Response(response_payload, status=status.HTTP_200_OK)
+        resp['X-Response-Time'] = f"{round((pytime.perf_counter() - _t_start) * 1000, 2)}ms"
+        resp['Server-Timing'] = f"total;dur={round((pytime.perf_counter() - _t_start) * 1000, 2)}"
+        return resp
 
 class PaidLeaveViewSet(viewsets.ModelViewSet):
     queryset = PaidLeave.objects.all().order_by('-start_time')

@@ -665,7 +665,8 @@ def log_activity(
     target_model=None,
     target_id=None,
     target_name=None,
-    details=None
+    details=None,
+    async_log=False
 ):
     """Utility to log activity anywhere across the application."""
     import logging
@@ -690,27 +691,40 @@ def log_activity(
                     actor_role = 'employee'
             except Exception:
                 pass
-        elif request and hasattr(request, 'data') and request.data.get('username'):
+        elif request and hasattr(request, 'data') and isinstance(request.data, dict) and request.data.get('username'):
             actor_username = str(request.data.get('username'))
 
         ip_addr = get_client_ip(request) if request else None
         u_agent = request.META.get('HTTP_USER_AGENT', '') if request else None
 
-        return ActivityLog.objects.create(
-            actor=user if (user and hasattr(user, 'pk') and user.pk) else None,
-            actor_username=actor_username or 'System/Anonymous',
-            actor_name=actor_name or actor_username or 'System/Anonymous',
-            actor_role=actor_role or '',
-            action_type=action_type,
-            category=category,
-            description=description,
-            target_model=str(target_model) if target_model else None,
-            target_id=str(target_id) if target_id is not None else None,
-            target_name=str(target_name) if target_name else None,
-            ip_address=ip_addr,
-            user_agent=u_agent,
-            details=details or {},
-        )
+        def _do_create():
+            try:
+                return ActivityLog.objects.create(
+                    actor=user if (user and hasattr(user, 'pk') and user.pk) else None,
+                    actor_username=actor_username or 'System/Anonymous',
+                    actor_name=actor_name or actor_username or 'System/Anonymous',
+                    actor_role=actor_role or '',
+                    action_type=action_type,
+                    category=category,
+                    description=description,
+                    target_model=str(target_model) if target_model else None,
+                    target_id=str(target_id) if target_id is not None else None,
+                    target_name=str(target_name) if target_name else None,
+                    ip_address=ip_addr,
+                    user_agent=u_agent,
+                    details=details or {},
+                )
+            except Exception as ex:
+                logging.getLogger('management').error(f"Failed to save activity log: {ex}")
+                return None
+
+        from django.db import connection
+        if async_log and not getattr(connection, 'in_atomic_block', False):
+            import threading
+            threading.Thread(target=_do_create, daemon=True).start()
+            return None
+        else:
+            return _do_create()
     except Exception as e:
         logging.getLogger('management').error(f"Failed to log activity: {e}")
         return None
