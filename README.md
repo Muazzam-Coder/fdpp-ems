@@ -1,410 +1,313 @@
 # FDPP Employee Management System (EMS)
 
-A complete, production-ready Employee Management System built with Django REST Framework that handles employee information, attendance tracking, leave management, and payroll calculations.
+A complete, production-ready Employee Management System built with Django REST Framework that handles employee information, attendance tracking, leave management, shift history, overtime, holidays, and payroll calculations.
 
-## 🎯 Key Features
+## Key Features
 
 ### Employee Management
-- ✅ Complete employee profile management
-- ✅ Multiple shift type support
-- ✅ Emergency contact information
-- ✅ Profile image upload
-- ✅ Active/Inactive status tracking
+- Complete employee profile management
+- **Shift history tracking** with salary snapshots
+- **Weekly off-day configuration** (per employee)
+- Emergency contact information
+- Profile image upload
+- Active/Inactive status tracking
 
 ### Attendance Tracking
-- ✅ Check-in/Check-out system with automatic timestamps
-- ✅ Late arrival detection
-- ✅ **14-hour daily limit enforcement**
-- ✅ Status tracking (On Time, Late, Absent, On Leave)
-- ✅ Daily, weekly, and monthly attendance reports
+- Check-in/Check-out system with automatic timestamps
+- Late arrival detection (based on active shift)
+- **14-hour daily limit enforcement**
+- Status tracking (On Time, Late, Absent, On Leave)
+- Daily, weekly, and monthly attendance reports
+
+### Shift Management
+- **Shift history** — every shift assignment is recorded with date ranges
+- **Assign shifts ad-hoc** — no pre-planning required
+- **Auto-close previous shifts** when a new one is assigned
+- **Salary snapshot** — stores salary at time of assignment
 
 ### Leave Management
-- ✅ Multiple leave types (Sick, Casual, Earned, Unpaid, Maternity)
-- ✅ Leave request workflow
-- ✅ Manager approval system
-- ✅ Leave duration calculation
-- ✅ Pending leave tracking
+- Multiple leave types (Sick, Casual, Earned, Unpaid, Maternity)
+- Leave request workflow
+- Manager approval system
+- Leave duration calculation
+- Pending leave tracking
+
+### Holiday Management
+- Company-wide **declared holidays** (Eid, etc.)
+- **Paid holidays** automatically included in salary calculations
+
+### Overtime Management
+- Manager-approved overtime with pending/approved/rejected workflow
+- Overtime paid at **same hourly rate** as regular hours
 
 ### Payroll System
-- ✅ Hourly rate calculations
-- ✅ Overtime compensation (1.5x pay rate)
-- ✅ Flexible salary checkout by date range
-- ✅ Detailed payout breakdowns
-- ✅ Monthly and custom period calculations
+- **Per-shift hourly rate** calculation based on salary and working days
+- Prorated salary when shifts change mid-month
+- Includes paid holidays, weekly off-days, approved leaves, and overtime
+- Detailed payout breakdowns by shift period
+- Flexible payout calculation for any date range
 
 ### Reporting & Analytics
-- ✅ Real-time daily attendance reports
-- ✅ Weekly work hour summaries
-- ✅ Monthly employee statistics
-- ✅ Late arrival tracking and analysis
-- ✅ Employee-wise attendance history
+- Real-time daily attendance reports
+- Weekly work hour summaries
+- Monthly employee statistics
+- Late arrival tracking and analysis
+- Employee-wise attendance history
+- Excel export with payout data
 
 ---
 
-## 📦 Quick Start
+## Quick Start
 
 ### Prerequisites
 - Python 3.8+
 - pip (Python package manager)
 
-### Installation (2 minutes)
+### Installation
 
 ```bash
 # 1. Navigate to project
-cd d:\FDPP\ attendence\fdpp_ems
+cd fdpp_ems
 
 # 2. Create virtual environment
 python -m venv venv
 venv\Scripts\activate
 
 # 3. Install dependencies
-pip install django==6.0.3 djangorestframework==3.14.0 django-filter==23.5 pillow==10.1.0
+pip install -r requirements/requirements.txt
 
 # 4. Apply migrations
-python manage.py makemigrations management
 python manage.py migrate
 
 # 5. Create admin user
 python manage.py createsuperuser
 
-# 6. Run server
-python manage.py runserver
+# 6. Run server (development)
+python manage.py runserver --insecure
+# OR with Daphne (production)
+daphne -b 0.0.0.0 -p 8000 fdpp_ems.asgi:application
 ```
 
 ### Access the System
-- **Admin Panel**: http://localhost:8000/admin/
-- **API**: http://localhost:8000/api/
-- **Employees**: http://localhost:8000/api/employees/
-- **Attendance**: http://localhost:8000/api/attendance/
-- **Leave**: http://localhost:8000/api/leave/
+- **Admin Panel**: `http://localhost:8000/admin/`
+- **API**: `http://localhost:8000/api/`
+- **Employees**: `http://localhost:8000/api/employees/`
+- **Attendance**: `http://localhost:8000/api/attendance/`
+- **Shifts**: `http://localhost:8000/api/shifts/`
+- **Holidays**: `http://localhost:8000/api/holidays/`
+- **Overtime**: `http://localhost:8000/api/overtime/`
+- **Leave**: `http://localhost:8000/api/leave/`
 
 ---
 
-## 📝 Basic API Examples
+## API Endpoints
 
-### Check-In Employee
-```bash
-curl -X POST http://localhost:8000/api/attendance/check_in/ \
-  -H "Content-Type: application/json" \
-  -d '{"emp_id": "EMP001"}'
+### Authentication
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/api/auth/register/` | Register new user + employee |
+| POST | `/api/auth/login/` | Login |
+| POST | `/api/auth/create_admin_manager/` | Create admin/manager (admin only) |
+| POST | `/api/token/` | Get JWT token |
+| POST | `/api/token/refresh/` | Refresh JWT token |
+
+### Employees
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/employees/` | List all employees |
+| POST | `/api/employees/` | Create employee |
+| GET | `/api/employees/{emp_id}/` | Get employee details |
+| PATCH | `/api/employees/{emp_id}/` | Update employee |
+| GET | `/api/employees/active_employees/` | List active employees |
+| GET | `/api/employees/employee_stats/` | Get statistics |
+| GET | `/api/employees/{emp_id}/attendance_report/` | Attendance report |
+| GET | `/api/employees/{emp_id}/calculate_payout/` | **Calculate payout (updated)** |
+| GET/POST | `/api/employees/{emp_id}/assign_shift/` | **Get/assign a shift (new)** |
+| GET | `/api/employees/{emp_id}/shift_history/` | **View shift history (new)** |
+| GET/POST | `/api/employees/{emp_id}/relatives/` | Manage relatives |
+
+### Attendance
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/attendance/` | List records (supports filters) |
+| POST | `/api/attendance/check_in/` | Check-in/out |
+| POST | `/api/attendance/auto_attendance/` | Biometric auto attendance |
+| POST | `/api/attendance/mark_absent/` | Mark absent (admin only) |
+| GET | `/api/attendance/daily_report/` | Daily report |
+| GET | `/api/attendance/weekly_report/` | Weekly report |
+| GET | `/api/attendance/monthly_report/` | Monthly report |
+| GET | `/api/attendance/export_excel/` | Export attendance to Excel |
+| GET | `/api/attendance/export_payout/` | Export payout to Excel |
+
+### Shifts
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/shifts/` | List all shifts |
+| POST | `/api/shifts/` | Create shift |
+| PATCH | `/api/shifts/{id}/` | Update shift |
+| DELETE | `/api/shifts/{id}/` | Delete shift |
+
+### Holidays (New)
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/holidays/` | List all holidays |
+| POST | `/api/holidays/` | Create holiday |
+| PATCH | `/api/holidays/{id}/` | Update holiday |
+| DELETE | `/api/holidays/{id}/` | Delete holiday |
+
+### Overtime (New)
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/overtime/` | List overtime records |
+| POST | `/api/overtime/` | Create overtime request |
+| POST | `/api/overtime/{id}/approve/` | Approve overtime |
+| POST | `/api/overtime/{id}/reject/` | Reject overtime |
+
+### Leave
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/leave/` | List all leaves |
+| POST | `/api/leave/` | Create leave request |
+| POST | `/api/leave/{id}/approve/` | Approve leave |
+| POST | `/api/leave/{id}/reject/` | Reject leave |
+| GET | `/api/leave/pending_approvals/` | Pending leaves |
+| GET | `/api/leave/employee_leaves/` | Employee leaves |
+
+### Access Levels
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/access-levels/` | List all (admin only) |
+| GET | `/api/access-levels/admins/` | List admins |
+| GET | `/api/access-levels/managers/` | List managers |
+
+---
+
+## Payout Calculation
+
+The payout system uses **per-shift hourly rates** with salary prorated by calendar days.
+
+### Formula
+
+```
+For each shift period in the date range:
+  month_days        = total calendar days in the month
+  period_days       = calendar days in this shift period
+  weekly_off_count  = number of weekly off-days in this period
+  working_days      = period_days - weekly_off_count
+  shift_hours       = shift_end_time - shift_start_time
+  expected_hours    = working_days × shift_hours
+  salary_portion    = salary_snapshot × (period_days / month_days)
+  hourly_rate       = salary_portion / expected_hours
+
+  For each date:
+    attendance → actual_hours × hourly_rate
+    off-day    → shift_hours × hourly_rate (paid)
+    holiday    → shift_hours × hourly_rate (paid)
+    leave      → shift_hours × hourly_rate (paid)
+    absent     → $0
+    overtime   → ot_hours × hourly_rate (same rate)
 ```
 
-### Check-Out Employee
-```bash
-curl -X POST http://localhost:8000/api/attendance/check_out/ \
-  -H "Content-Type: application/json" \
-  -d '{"emp_id": "EMP001"}'
+### Example Payout Request
+```
+GET /api/employees/1/calculate_payout/?start_date=2026-06-01&end_date=2026-06-30
 ```
 
-### Get Daily Report
-```bash
-curl http://localhost:8000/api/attendance/daily_report/?date=2024-01-15
+See [FRONTEND_API_GUIDE.md](FRONTEND_API_GUIDE.md) for the full response shape.
+
+---
+
+## Database Schema
+
+### Employee
+```
+Fields: emp_id (PK), name, salary, current_shift (FK), weekly_off_day, ...
+Removed: shift_type, start_time, end_time
 ```
 
-### Calculate Payout
-```bash
-curl "http://localhost:8000/api/employees/EMP001/calculate_payout/?start_date=2024-01-01&end_date=2024-01-31"
+### EmployeeShiftHistory (New)
+```
+Fields: employee (FK), shift (FK), from_date, to_date, salary (snapshot),
+        shift_start_time, shift_end_time
 ```
 
-### Get Employee Stats
-```bash
-curl http://localhost:8000/api/employees/employee_stats/
+### Holiday (New)
+```
+Fields: date (unique), name, is_paid
+```
+
+### Overtime (New)
+```
+Fields: employee (FK), date, start_time, end_time, approved_by (FK),
+        status, note
 ```
 
 ---
 
-## 📊 Database Schema
-
-### Employee Model
-```
-Fields: emp_id (PK), name, salary, hourly_rate, shift_type, 
-        start_time, end_time, address, phone, CNIC, 
-        relative info, status, dates
-Relationships: One-to-Many with Attendance & Leave
-```
-
-### Attendance Model
-```
-Fields: date, check_in, check_out, status, message_late
-Calculated: total_hours (max 14), overtime_hours, is_late
-Validation: 14-hour limit enforced
-```
-
-### PaidLeave Model
-```
-Fields: leave_type, start_time, end_time, reason, approved
-Calculated: duration_days
-Types: sick, casual, earned, unpaid, maternity
-```
-
-### Shift Model
-```
-Fields: name, start_time, end_time, description
-Pre-configured: Morning, Afternoon, Night shifts available
-```
-
----
-
-## 🔧 Project Structure
+## Project Structure
 
 ```
 fdpp_ems/
 ├── manage.py
 ├── db.sqlite3
-├── README.md (this file)
-├── SETUP.md (detailed setup guide)
-├── API_DOCUMENTATION.md (API reference)
-├── EXAMPLES.md (usage examples)
+├── README.md
+├── FRONTEND_API_GUIDE.md          (guide for frontend devs)
+├── BACKEND_CHANGES.md             (guide for backend changes)
 ├── fdpp_ems/
-│   ├── settings.py (Django config)
-│   ├── urls.py (project URLs)
+│   ├── settings.py
+│   ├── urls.py
 │   ├── wsgi.py
 │   └── asgi.py
+├── staticfiles/                   (collected static files)
+├── templates/                     (overridden Django templates)
 └── management/
-    ├── models.py (Employee, Attendance, Leave, Shift)
-    ├── views.py (REST API viewsets)
-    ├── serializers.py (serializers)
-    ├── urls.py (app URLs)
-    ├── admin.py (Django admin config)
-    ├── apps.py
-    ├── tests.py
+    ├── models.py                  (all models)
+    ├── views.py                   (all API views)
+    ├── serializers.py             (all serializers)
+    ├── urls.py                    (app URLs)
+    ├── admin.py                   (Django admin config)
     └── migrations/
 ```
 
 ---
 
-## 🚀 Core Features In Depth
-
-### 1. Attendance Check-In/Check-Out
-- **Automatic timestamps** when employee checks in/out
-- **Late detection** compares check-in time with shift start time
-- **14-hour validation** prevents excessive work days
-- **Status assignment** (on_time, late, absent, on_leave)
-
-### 2. Payroll Calculation
-**Formula:**
-```
-Base Pay = Total Hours × Hourly Rate
-Overtime Pay = Overtime Hours × Hourly Rate × 1.5
-Total Payout = Base Pay + Overtime Pay
-```
-
-**Example:**
-- Hourly Rate: $312.50
-- Regular Hours: 160 (20 days × 8 hours)
-- Overtime Hours: 20
-- **Total Payout**: (160 × 312.50) + (20 × 312.50 × 1.5) = $59,375
-
-### 3. Intelligent Filtering
-- **Employee filters**: By status, shift type
-- **Attendance filters**: By date range, employee, status
-- **Leave filters**: By employee, type, approval status
-- **Pagination**: Default 20 records per page
-
-### 4. Comprehensive Reporting
-- **Daily**: Present/absent/late counts with details
-- **Weekly**: Total hours, late arrivals, daily averages
-- **Monthly**: Multi-employee stats, attendance trends
-- **Custom**: Any date range with detailed breakdowns
-
----
-
-## 📖 Documentation
-
-1. **[SETUP.md](SETUP.md)** - Complete installation and configuration guide
-2. **[API_DOCUMENTATION.md](API_DOCUMENTATION.md)** - Full API reference with all endpoints
-3. **[EXAMPLES.md](EXAMPLES.md)** - Usage examples and code samples
-
----
-
-## 🔐 Configuration
+## Configuration
 
 ### Current Settings
-- **DEBUG**: True (for development)
-- **Database**: SQLite3 (change to PostgreSQL for production)
-- **Time Zone**: UTC (configure in settings.py)
-- **Authentication**: Session-based (configure as needed)
-
-### Important Settings (settings.py)
-```python
-# REST Framework config
-REST_FRAMEWORK = {
-    'PAGE_SIZE': 20,  # Default pagination
-    'DEFAULT_FILTER_BACKENDS': ['django_filters.rest_framework.DjangoFilterBackend'],
-}
-
-# Time zone (change for your region)
-TIME_ZONE = 'UTC'  # Change to 'Asia/Karachi' for Pakistan
-```
+- **DEBUG**: False
+- **Database**: SQLite3
+- **Time Zone**: Asia/Karachi
+- **Authentication**: JWT (SimpleJWT) + Session
+- **Static Files**: WhiteNoise
 
 ---
 
-## 🛠️ Common Operations
+## Version History
 
-### Add New Employee
-```python
-POST /api/employees/
-{
-    "emp_id": "EMP001",
-    "name": "John Doe",
-    "salary": 50000,
-    "hourly_rate": 312.50,
-    "shift_type": "morning",
-    "start_time": "06:00:00",
-    "end_time": "14:00:00",
-    ...
-}
-```
+**v2.0** (Current)
+- Shift history tracking with salary snapshots
+- Per-employee weekly off-day configuration
+- Company-wide holidays management
+- Overtime management with approval workflow
+- Per-shift hourly rate payout calculation
+- Paid off-days, holidays, and leaves in salary
+- Updated check-in uses active shift from history
 
-### Daily Operations
-```bash
-# Morning: Check-in all employees
-POST /api/attendance/check_in/
-
-# Evening: Check-out all employees
-POST /api/attendance/check_out/
-
-# Get daily summary
-GET /api/attendance/daily_report/
-```
-
-### Month-End
-```bash
-# Calculate all payouts
-GET /api/employees/{id}/calculate_payout/?start_date=2024-01-01&end_date=2024-01-31
-
-# Get master attendance report
-GET /api/attendance/monthly_report/?month=1&year=2024
-```
+**v1.0**
+- Initial employee management system
+- Attendance tracking
+- Leave management
+- Basic payroll calculations
 
 ---
 
-## 🐛 Troubleshooting
+## Documentation
 
-### Port Already in Use
-```bash
-python manage.py runserver 8001
-```
-
-### Module Not Found
-```bash
-pip install djangorestframework django-filter
-```
-
-### Database Issues
-```bash
-python manage.py migrate management --run-syncdb
-```
-
-See [SETUP.md](SETUP.md) for more troubleshooting tips.
+- **[FRONTEND_API_GUIDE.md](FRONTEND_API_GUIDE.md)** — Complete API reference for frontend developers
+- **[BACKEND_CHANGES.md](BACKEND_CHANGES.md)** — Summary of backend changes
 
 ---
 
-## 📋 API Endpoint Summary
-
-### Employees
-- `GET /api/employees/` - List all employees
-- `POST /api/employees/` - Create employee
-- `GET /api/employees/{id}/` - Get single employee
-- `PATCH /api/employees/{id}/` - Update employee
-- `GET /api/employees/{id}/calculate_payout/` - Calculate payout
-- `GET /api/employees/{id}/attendance_report/` - Get attendance report
-- `GET /api/employees/employee_stats/` - Get statistics
-
-### Attendance
-- `GET /api/attendance/` - List attendance records
-- `POST /api/attendance/check_in/` - Check-in employee
-- `POST /api/attendance/check_out/` - Check-out employee
-- `GET /api/attendance/daily_report/` - Daily report
-- `GET /api/attendance/weekly_report/` - Weekly report
-- `GET /api/attendance/monthly_report/` - Monthly report
-
-### Leave
-- `GET /api/leave/` - List all leaves
-- `POST /api/leave/` - Create leave request
-- `POST /api/leave/{id}/approve/` - Approve leave
-- `POST /api/leave/{id}/reject/` - Reject leave
-- `GET /api/leave/pending_approvals/` - Get pending leaves
-- `GET /api/leave/employee_leaves/` - Get employee's leaves
-
-### Shifts
-- `GET /api/shifts/` - List all shifts
-- `POST /api/shifts/` - Create shift
-- `PATCH /api/shifts/{id}/` - Update shift
-
----
-
-## 💡 System Constraints
-
-1. **14-Hour Daily Limit**: Work duration cannot exceed 14 hours in a single day
-2. **Unique Daily Attendance**: Only one attendance record per employee per day
-3. **Check-Out Validation**: Check-out time must be after check-in time
-4. **Shift Requirements**: Each employee must have assigned start and end times
-
----
-
-## 🎓 Learning Resources
-
-- [Django Documentation](https://docs.djangoproject.com/)
-- [Django REST Framework](https://www.django-rest-framework.org/)
-- [Django Filter](https://django-filter.readthedocs.io/)
-
----
-
-## 📞 Support
-
-For issues or questions:
-1. Check [SETUP.md](SETUP.md) for setup issues
-2. Review [API_DOCUMENTATION.md](API_DOCUMENTATION.md) for API questions
-3. See [EXAMPLES.md](EXAMPLES.md) for usage examples
-
----
-
-## 📄 License
+## License
 
 Open Source - Feel free to use and modify for your needs
-
----
-
-## 🔄 Version History
-
-**v1.0** (Current)
-- Employee management system
-- Complete attendance tracking
-- Leave management system
-- Payroll calculations
-- Comprehensive reporting
-- REST API with filtering
-
----
-
-## ✨ Features Implemented (Based on Requirements)
-
-From your image attachment:
-
-### Employee Fields ✅
-- name, profile_img, salary, PK:emp_id
-- shift_type, start_time, end_time
-- address, phone, CNIC, relative, r_phone, r_address
-
-### Constraints & Features ✅
-- ✅ 14 hrs limit for checked out attendance management
-- ✅ Every employee attendance with filters (day, week, month, custom, employee)
-- ✅ Add & edit user model (full CRUD operations)
-- ✅ Hourly payment calculations
-- ✅ Salary checkout for the payout
-- ✅ Paid leave (start_time to end_time)
-
-### Attendance Fields ✅
-- FK:emp_id, check_in, check_out, message (late), date
-
----
-
-**Created**: 2024  
-**Framework**: Django 6.0.3 + Django REST Framework 3.14  
-**Database**: SQLite3 (production-ready for PostgreSQL/MySQL)  
-**Python**: 3.8+
-
----
-
-🚀 **Ready to deploy! Follow [SETUP.md](SETUP.md) to get started in minutes.**

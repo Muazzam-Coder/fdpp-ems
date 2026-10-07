@@ -1,26 +1,35 @@
 from django.contrib import admin
-from django.urls import path, include
+from django.urls import path, include, re_path
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 from django.conf import settings
-from django.conf.urls.static import static
-from django.http import JsonResponse
+from django.http import JsonResponse, FileResponse, Http404
+import os
+import mimetypes
 
 
 def api_404(request, exception=None):
-    """Return JSON 404 for API paths, otherwise fall back to default HTML 404.
-
-    This helps API clients receive a consistent, user-friendly message when
-    an endpoint is not found or required path parameters are missing.
-    """
-    # Only return JSON for API namespace; let Django handle regular site 404s
     if request.path.startswith('/api/'):
         return JsonResponse({
             'error': 'Endpoint not found',
             'detail': 'The requested API endpoint or resource was not found. Verify the URL and required parameters.'
         }, status=404)
-    # For non-API requests, let Django render the default 404 page
     from django.shortcuts import render
     return render(request, '404.html', status=404)
+
+
+def serve_media_files(request, file_path):
+    """Serve uploaded media files."""
+    full_path = os.path.normpath(os.path.join(settings.MEDIA_ROOT, file_path))
+    media_root = os.path.normpath(settings.MEDIA_ROOT)
+    if not full_path.startswith(media_root):
+        raise Http404("Invalid path")
+    if not os.path.exists(full_path) or not os.path.isfile(full_path):
+        raise Http404("File not found")
+    content_type, _ = mimetypes.guess_type(full_path)
+    resp = FileResponse(open(full_path, 'rb'), content_type=content_type or 'application/octet-stream')
+    resp['Content-Length'] = os.path.getsize(full_path)
+    return resp
+
 
 urlpatterns = [
     path('admin/', admin.site.urls),
@@ -29,9 +38,12 @@ urlpatterns = [
     path('api/', include('management.urls')),
 ]
 
-# Serve media files in development
-if settings.DEBUG:
-    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+if settings.MEDIA_URL and settings.MEDIA_ROOT:
+    media_prefix = settings.MEDIA_URL.strip('/')
+    urlpatterns.insert(0, re_path(
+        r'^' + media_prefix + r'/(?P<file_path>.+)$',
+        serve_media_files,
+        name='serve_media'
+    ))
 
-# Wire up our custom 404 handler for API-friendly JSON responses
 handler404 = 'fdpp_ems.urls.api_404'
